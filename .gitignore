@@ -1,0 +1,33 @@
+# Secrets et configuration locale
+.env
+.env.*
+!.env.example
+
+# Dépendances
+/vendor/
+
+# Répertoires inscriptibles (on garde uniquement les fichiers de protection)
+/writable/cache/*
+!/writable/cache/index.html
+/writable/logs/*
+!/writable/logs/index.html
+/writable/session/*
+!/writable/session/index.html
+/writable/debugbar/*
+!/writable/debugbar/index.html
+/writable/uploads/*
+!/writable/uploads/index.html
+
+# Tests et rapports
+/build/
+phpunit.xml
+.phpunit.result.cache
+.php-cs-fixer.cache
+
+# Système / IDE
+.DS_Store
+.idea/
+.vscode/
+*.swp
+/writable/backups/
+/writable/uploads-testing/

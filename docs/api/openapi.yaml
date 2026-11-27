@@ -1,0 +1,6059 @@
+openapi: 3.0.3
+info:
+  title: WapiFood API
+  version: 1.0.0
+  description: |
+    API REST du backend WapiFood (plateforme SaaS multi-restaurants).
+
+    **Format des réponses** : toutes les réponses JSON utilisent une enveloppe commune.
+    - Succès : `{ success: true, message, data, meta }`
+    - Erreur : `{ success: false, message, errors, meta }` ; `meta.code` contient un code stable lisible par machine quand il existe.
+
+    **Authentification** : jeton d'accès JWT (15 min) dans l'en-tête `Authorization: Bearer <access_token>`.
+    Le renouvellement se fait avec le `refresh_token` (30 jours, à usage unique : chaque appel à `/auth/refresh`
+    en fournit un nouveau). Réutiliser un refresh token déjà utilisé révoque toute la session.
+
+    **Statut du compte** : après l'inscription, le compte est `pending` jusqu'à la vérification du téléphone par code SMS.
+    Un compte `pending` n'accède qu'aux routes `/auth/*` ; les autres renvoient `403 ACCOUNT_NOT_VERIFIED`.
+
+    **Codes d'erreur d'authentification** (`meta.code`) : `TOKEN_MISSING`, `TOKEN_INVALID`, `TOKEN_EXPIRED`,
+    `TOKEN_REVOKED`, `ACCOUNT_SUSPENDED`, `ACCOUNT_NOT_VERIFIED`, `ACCOUNT_LOCKED`, `INVALID_CREDENTIALS`,
+    `REFRESH_TOKEN_INVALID`, `REFRESH_TOKEN_REUSED`, `INVALID_CODE`, `OTP_COOLDOWN`, `OTP_QUOTA_EXCEEDED`,
+    `OTP_DELIVERY_UNAVAILABLE`, `FORBIDDEN_ROLE`, `RESTAURANT_ACCESS_DENIED`, `RESTAURANT_REQUIRED`, `PERMISSION_DENIED`.
+
+    **Espace restaurant** (`/restaurant/*`) : le restaurant est déterminé côté serveur à partir des appartenances
+    de l'utilisateur ; l'en-tête `X-Restaurant-Id` le précise s'il en a plusieurs. Chaque route exige une permission
+    liée au rôle dans le restaurant. Un restaurant suspendu est en lecture seule (`403 RESTAURANT_SUSPENDED`).
+
+    **Images** : URL publiques servies par `GET /media/...` (hors API). Fichiers ré-encodés côté serveur.
+
+    **Commandes** : le serveur recalcule tous les montants à partir du catalogue. Paiement : espèces uniquement
+    (Mobile Money désactivé tant qu'aucun agrégateur n'est choisi). Le restaurant encaisse et doit la commission à WapiFood. En-tête `Idempotency-Key` recommandé à la création.
+
+    **Montants** : toujours des chaînes décimales à 2 décimales (`"8.50"`), dans la devise du restaurant (USD ou CDF).
+
+    **Pagination** : `?page=&per_page=` ; métadonnées dans `meta.pagination`.
+
+    **Limitation des requêtes** : 120 requêtes / 60 s / IP par défaut. Au-delà : `429` + en-tête `Retry-After`.
+
+    Ce document ne décrit que les routes réellement implémentées.
+servers:
+  - url: /api/v1
+    description: API version 1
+security:
+  - bearerAuth: []
+
+tags:
+  - name: Système
+    description: Supervision et état du service
+  - name: Authentification
+    description: Inscription, connexion, jetons et sessions
+  - name: Compte
+    description: Compte de l'utilisateur connecté (vérification, mot de passe, sessions)
+  - name: Restaurants (public)
+    description: Annuaire et menus, sans authentification
+  - name: Espace restaurant
+    description: Profil, adresses, horaires et équipe du restaurant
+  - name: Catalogue
+    description: Catégories, produits, variantes, options et images
+  - name: Commandes (restaurant)
+    description: File des commandes reçues et changements de statut
+  - name: Finances
+    description: Commission due à WapiFood et journal financier du restaurant (propriétaire)
+  - name: Paiements
+    description: Notifications des fournisseurs de paiement (inactives tant qu'aucun agrégateur n'est branché)
+  - name: Espace client
+    description: Adresses de livraison, favoris et commandes du client (rôle customer, compte vérifié)
+  - name: Livraisons
+    description: Livreur du restaurant, échec de livraison et preuve photo privée
+  - name: Codes promo
+    description: Codes promo du restaurant (remise à sa charge)
+  - name: Avis
+    description: Avis clients (commande terminée, un par commande) et note des restaurants
+  - name: Notifications
+    description: Notifications in-app du compte ou du restaurant (les e-mails, SMS et WhatsApp partent par la file d'envoi)
+  - name: Administration
+    description: Validation et supervision des restaurants, codes promo plateforme, modération des avis (super_admin)
+
+paths:
+  /health:
+    get:
+      tags: [Système]
+      summary: État du service
+      description: Vérifie que l'application répond et que la base de données est joignable. Aucune authentification requise.
+      operationId: getHealth
+      security: []
+      responses:
+        '200':
+          description: Service opérationnel
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/Health'
+              example:
+                success: true
+                message: Service opérationnel.
+                data:
+                  status: ok
+                  service: wapifood-api
+                  api_version: 1.0.0
+                  time: '2026-11-25T14:00:00Z'
+                  checks:
+                    database: ok
+                meta: null
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '503':
+          description: Base de données injoignable
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+              example:
+                success: false
+                message: Service temporairement indisponible.
+                errors:
+                  database: unavailable
+                meta:
+                  health:
+                    status: degraded
+                    service: wapifood-api
+                    api_version: 1.0.0
+                    time: '2026-11-25T14:00:00Z'
+                    checks:
+                      database: unavailable
+
+  /webhooks/payments/{provider}:
+    post:
+      tags: [Paiements]
+      summary: Notification d'un fournisseur de paiement
+      operationId: paymentWebhook
+      description: |
+        **Inactif au MVP** : aucun agrégateur Mobile Money n'est branché, la route répond `404` pour tout fournisseur.
+
+        Quand un agrégateur sera activé : signature vérifiée (`401 WEBHOOK_SIGNATURE_INVALID` sinon), notification
+        enregistrée une seule fois (rejeu → `duplicate`), montant et devise contrôlés avant de confirmer le paiement.
+      security: []
+      parameters:
+        - $ref: '#/components/parameters/Provider'
+      responses:
+        '200':
+          description: "Notification acquittée (`processed`, `duplicate` ou `ignored` si montant, devise ou référence ne correspondent pas)"
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/WebhookResult'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /auth/register:
+    post:
+      tags: [Authentification]
+      summary: Créer un compte client ou propriétaire de restaurant
+      description: |
+        Crée un compte `pending`, ouvre une session et envoie un code de vérification par SMS.
+        Mot de passe : 10 caractères minimum, avec minuscule, majuscule et chiffre, sans les informations personnelles.
+        Limite : 10 inscriptions par heure et par IP.
+      operationId: register
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RegisterRequest'
+            example:
+              first_name: Grace
+              last_name: Mbuyi
+              email: grace@exemple.cd
+              phone: '0812345678'
+              password: Kinshasa-Secure-2026
+              account_type: customer
+      responses:
+        '201':
+          description: Compte créé
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          user:
+                            $ref: '#/components/schemas/User'
+                          tokens:
+                            $ref: '#/components/schemas/Tokens'
+                          phone_verification:
+                            type: object
+                            properties:
+                              sent:
+                                type: boolean
+                                description: false si le SMS n'a pas pu partir (redemander via /auth/verify-phone/resend)
+        '400':
+          $ref: '#/components/responses/InvalidJson'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+
+  /auth/login:
+    post:
+      tags: [Authentification]
+      summary: Se connecter par téléphone ou e-mail
+      description: |
+        `identifier` : numéro de téléphone (0812345678, +243812345678…) ou adresse e-mail.
+        Après 5 échecs consécutifs, le compte est verrouillé 15 minutes (`429 ACCOUNT_LOCKED`).
+        Limite : 10 requêtes par minute et par IP.
+      operationId: login
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LoginRequest'
+            example:
+              identifier: '0812345678'
+              password: Kinshasa-Secure-2026
+      responses:
+        '200':
+          description: Connexion réussie
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          user:
+                            $ref: '#/components/schemas/User'
+                          tokens:
+                            $ref: '#/components/schemas/Tokens'
+        '401':
+          description: Identifiant ou mot de passe incorrect (même réponse si le compte n'existe pas)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+              example:
+                success: false
+                message: Identifiant ou mot de passe incorrect.
+                errors: {}
+                meta:
+                  code: INVALID_CREDENTIALS
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+        '429':
+          description: Compte verrouillé (`ACCOUNT_LOCKED`, `errors.retry_after` en secondes) ou limite de requêtes (`RATE_LIMITED`)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+
+  /auth/refresh:
+    post:
+      tags: [Authentification]
+      summary: Renouveler la session (rotation du refresh token)
+      description: |
+        Renvoie une nouvelle paire de jetons. L'ancien refresh token devient inutilisable.
+        Le réutiliser révoque toute la session (`401 REFRESH_TOKEN_REUSED`), car c'est le signe d'un vol de jeton.
+      operationId: refreshToken
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [refresh_token]
+              properties:
+                refresh_token:
+                  type: string
+      responses:
+        '200':
+          $ref: '#/components/responses/TokensResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+
+  /auth/logout:
+    post:
+      tags: [Compte]
+      summary: Se déconnecter
+      description: Ferme la session courante ; avec `all_devices` à true, ferme toutes les sessions et invalide tous les jetons d'accès.
+      operationId: logout
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                all_devices:
+                  type: boolean
+                  default: false
+      responses:
+        '200':
+          $ref: '#/components/responses/EmptySuccess'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /auth/me:
+    get:
+      tags: [Compte]
+      summary: Profil de l'utilisateur connecté
+      operationId: me
+      responses:
+        '200':
+          description: Utilisateur connecté
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/User'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+    patch:
+      tags: [Compte]
+      summary: Modifier son profil
+      operationId: updateProfile
+      description: |
+        Prénom, nom et e-mail. Le téléphone (identifiant de connexion vérifié par SMS) n'est pas modifiable ici.
+        Un nouvel e-mail doit être vérifié à nouveau (`email_verified: false`). Envoyer une chaîne vide efface le nom ou l'e-mail.
+        Erreur : `409 EMAIL_TAKEN`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ProfileUpdate'
+      responses:
+        '200':
+          description: Profil mis à jour
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/User'
+        '400':
+          $ref: '#/components/responses/InvalidJson'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+
+  /auth/verify-phone:
+    post:
+      tags: [Compte]
+      summary: Vérifier le téléphone avec le code reçu par SMS
+      description: Active le compte (`pending` → `active`). Un code expire après 10 minutes et est invalidé après 5 essais.
+      operationId: verifyPhone
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CodeRequest'
+            example:
+              code: '482913'
+      responses:
+        '200':
+          description: Téléphone vérifié ; utilisateur mis à jour
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/User'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+
+  /auth/verify-phone/resend:
+    post:
+      tags: [Compte]
+      summary: Renvoyer le code de vérification
+      description: Un envoi par minute au maximum, 5 par heure.
+      operationId: resendPhoneCode
+      responses:
+        '200':
+          $ref: '#/components/responses/EmptySuccess'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '503':
+          $ref: '#/components/responses/OtpUnavailable'
+
+  /auth/forgot-password:
+    post:
+      tags: [Authentification]
+      summary: Demander un code de réinitialisation du mot de passe
+      description: |
+        Envoie un code par SMS (identifiant téléphone) ou par e-mail (identifiant e-mail).
+        La réponse est identique, que le compte existe ou non.
+      operationId: forgotPassword
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [identifier]
+              properties:
+                identifier:
+                  type: string
+            example:
+              identifier: '0812345678'
+      responses:
+        '200':
+          $ref: '#/components/responses/EmptySuccess'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '503':
+          $ref: '#/components/responses/OtpUnavailable'
+
+  /auth/reset-password:
+    post:
+      tags: [Authentification]
+      summary: Réinitialiser le mot de passe avec le code reçu
+      description: Ferme toutes les sessions et invalide tous les jetons d'accès. L'utilisateur doit se reconnecter.
+      operationId: resetPassword
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [identifier, code, password]
+              properties:
+                identifier:
+                  type: string
+                code:
+                  type: string
+                  pattern: '^\d{4,8}$'
+                password:
+                  type: string
+                  minLength: 10
+                  maxLength: 128
+      responses:
+        '200':
+          $ref: '#/components/responses/EmptySuccess'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+
+  /auth/change-password:
+    post:
+      tags: [Compte]
+      summary: Changer de mot de passe
+      description: Renvoie de nouveaux jetons pour la session courante ; toutes les autres sessions sont fermées.
+      operationId: changePassword
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [current_password, new_password]
+              properties:
+                current_password:
+                  type: string
+                new_password:
+                  type: string
+                  minLength: 10
+                  maxLength: 128
+      responses:
+        '200':
+          $ref: '#/components/responses/TokensResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+
+  /auth/sessions:
+    get:
+      tags: [Compte]
+      summary: Lister les sessions actives (appareils connectés)
+      operationId: listSessions
+      responses:
+        '200':
+          description: Sessions actives, la plus récente en premier
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items:
+                          $ref: '#/components/schemas/Session'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /auth/sessions/{sessionId}:
+    delete:
+      tags: [Compte]
+      summary: Fermer une session
+      operationId: revokeSession
+      parameters:
+        - name: sessionId
+          in: path
+          required: true
+          schema:
+            type: string
+            pattern: '^[a-f0-9]{32}$'
+      responses:
+        '204':
+          description: Session fermée
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /notifications:
+    get:
+      tags: [Notifications]
+      summary: Mes notifications
+      operationId: listMyNotifications
+      description: |
+        Notifications in-app, plus récentes d'abord. `meta.unread_count` : nombre de non lues.
+        Tout compte vérifié (client, propriétaire, personnel…).
+      parameters:
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/PerPage'
+        - $ref: '#/components/parameters/UnreadFilter'
+      responses:
+        '200':
+          description: "Notifications"
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items:
+                          $ref: '#/components/schemas/Notification'
+                      meta:
+                        allOf:
+                          - $ref: '#/components/schemas/PaginationMeta'
+                          - type: object
+                            properties:
+                              unread_count:
+                                type: integer
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+
+  /notifications/read-all:
+    post:
+      tags: [Notifications]
+      summary: Tout marquer comme lu
+      operationId: readAllMyNotifications
+      responses:
+        '200':
+          description: "Nombre de notifications marquées"
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/ReadAllResult'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /notifications/{notificationId}/read:
+    patch:
+      tags: [Notifications]
+      summary: Marquer une notification comme lue
+      operationId: readMyNotification
+      parameters:
+        - $ref: '#/components/parameters/NotificationId'
+      responses:
+        '200':
+          description: "Notification lue"
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/Notification'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /restaurants:
+    get:
+      tags: [Restaurants (public)]
+      summary: Annuaire des restaurants
+      operationId: listRestaurants
+      description: |
+        Restaurants validés (actifs ou fermés temporairement). Tri : actifs, mis en avant, puis par nom.
+      security: []
+      parameters:
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/PerPage'
+        - $ref: '#/components/parameters/Search'
+        - $ref: '#/components/parameters/City'
+        - $ref: '#/components/parameters/Commune'
+        - $ref: '#/components/parameters/Featured'
+        - $ref: '#/components/parameters/Delivery'
+        - $ref: '#/components/parameters/Pickup'
+      responses:
+        '200':
+          description: Liste paginée
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items:
+                          $ref: '#/components/schemas/RestaurantSummary'
+                      meta:
+                        $ref: '#/components/schemas/PaginationMeta'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+    post:
+      tags: [Espace restaurant]
+      summary: Inscrire un restaurant
+      operationId: createRestaurant
+      description: |
+        Réservé aux comptes « restaurant_owner » vérifiés. Le restaurant est créé au statut « pending » et devient visible après validation.
+        Le taux de commission, le statut et la mise en avant sont fixés par WapiFood (champs ignorés s'ils sont envoyés).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RestaurantCreate'
+      responses:
+        '201':
+          description: Restaurant créé (en attente de validation)
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/RestaurantManagement'
+        '400':
+          $ref: '#/components/responses/InvalidJson'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+
+  /restaurants/{restaurantId}:
+    get:
+      tags: [Restaurants (public)]
+      summary: Fiche publique d'un restaurant
+      operationId: getRestaurant
+      security: []
+      parameters:
+        - $ref: '#/components/parameters/RestaurantId'
+      responses:
+        '200':
+          description: Restaurant
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/RestaurantPublic'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /restaurants/{restaurantId}/categories:
+    get:
+      tags: [Restaurants (public)]
+      summary: Catégories actives du menu
+      operationId: listRestaurantCategories
+      security: []
+      parameters:
+        - $ref: '#/components/parameters/RestaurantId'
+      responses:
+        '200':
+          description: Catégories
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items:
+                          $ref: '#/components/schemas/Category'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /restaurants/{restaurantId}/products:
+    get:
+      tags: [Restaurants (public)]
+      summary: Produits commandables du menu
+      operationId: listRestaurantProducts
+      description: |
+        Produits disponibles, dans une catégorie active ; seules les variantes et options actives sont listées.
+      security: []
+      parameters:
+        - $ref: '#/components/parameters/RestaurantId'
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/PerPage'
+        - $ref: '#/components/parameters/Search'
+        - $ref: '#/components/parameters/CategoryFilter'
+        - $ref: '#/components/parameters/Featured'
+      responses:
+        '200':
+          description: Liste paginée
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items:
+                          $ref: '#/components/schemas/Product'
+                      meta:
+                        $ref: '#/components/schemas/PaginationMeta'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+
+  /restaurants/{restaurantId}/products/{productId}:
+    get:
+      tags: [Restaurants (public)]
+      summary: Détail d'un produit du menu
+      operationId: getRestaurantProduct
+      security: []
+      parameters:
+        - $ref: '#/components/parameters/RestaurantId'
+        - $ref: '#/components/parameters/ProductId'
+      responses:
+        '200':
+          description: Produit
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/Product'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /restaurants/{restaurantId}/reviews:
+    get:
+      tags: [Avis]
+      summary: Avis publiés d'un restaurant
+      operationId: listRestaurantReviews
+      security: []
+      description: |
+        Avis publiés, plus récents d'abord. Auteur : prénom et initiale du nom. `meta.rating` : note moyenne (au dixième) et nombre d'avis publiés.
+        Restaurant non visible publiquement : 404.
+      parameters:
+        - $ref: '#/components/parameters/RestaurantId'
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/PerPage'
+      responses:
+        '200':
+          description: "Avis publiés"
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items:
+                          $ref: '#/components/schemas/PublicReview'
+                      meta:
+                        allOf:
+                          - $ref: '#/components/schemas/PaginationMeta'
+                          - type: object
+                            properties:
+                              rating:
+                                $ref: '#/components/schemas/RatingSummary'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+
+  /restaurant/profile:
+    get:
+      tags: [Espace restaurant]
+      summary: Profil du restaurant
+      operationId: getRestaurantProfile
+      description: |
+        Restaurant ciblé : en-tête X-Restaurant-Id (facultatif si l'utilisateur n'appartient qu'à un restaurant).
+        Permission : restaurant.view.
+      parameters:
+        - $ref: '#/components/parameters/XRestaurantId'
+      responses:
+        '200':
+          description: Profil
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/RestaurantManagement'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+    put:
+      tags: [Espace restaurant]
+      summary: Modifier le profil
+      operationId: updateRestaurantProfile
+      description: |
+        Mise à jour partielle. Permission : restaurant.update.
+        La devise ne peut plus changer dès qu'un produit existe (409 CURRENCY_LOCKED).
+      parameters:
+        - $ref: '#/components/parameters/XRestaurantId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RestaurantUpdate'
+      responses:
+        '200':
+          description: Profil mis à jour
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/RestaurantManagement'
+        '400':
+          $ref: '#/components/responses/InvalidJson'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+
+  /restaurant/availability:
+    patch:
+      tags: [Espace restaurant]
+      summary: Fermer temporairement ou rouvrir
+      operationId: setRestaurantAvailability
+      description: |
+        Bascule active ↔ paused. Uniquement pour un restaurant validé. Permission : restaurant.update.
+      parameters:
+        - $ref: '#/components/parameters/XRestaurantId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AvailabilityRequest'
+      responses:
+        '200':
+          description: Profil
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/RestaurantManagement'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+
+  /restaurant/submit:
+    post:
+      tags: [Espace restaurant]
+      summary: Soumettre à nouveau après un refus
+      operationId: resubmitRestaurant
+      description: |
+        rejected → pending. Réservé au propriétaire.
+      parameters:
+        - $ref: '#/components/parameters/XRestaurantId'
+      responses:
+        '200':
+          description: Profil
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/RestaurantManagement'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /restaurant/logo:
+    post:
+      tags: [Espace restaurant]
+      summary: Remplacer le logo
+      operationId: uploadRestaurantLogo
+      parameters:
+        - $ref: '#/components/parameters/XRestaurantId'
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file]
+              properties:
+                file:
+                  type: string
+                  format: binary
+                  description: Image JPEG, PNG ou WebP (2 Mo et 4000 × 4000 px maximum). Ré-encodée côté serveur.
+      responses:
+        '200':
+          description: Profil
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/RestaurantManagement'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+
+  /restaurant/cover:
+    post:
+      tags: [Espace restaurant]
+      summary: Remplacer l'image de couverture
+      operationId: uploadRestaurantCover
+      parameters:
+        - $ref: '#/components/parameters/XRestaurantId'
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file]
+              properties:
+                file:
+                  type: string
+                  format: binary
+                  description: Image JPEG, PNG ou WebP (2 Mo et 4000 × 4000 px maximum). Ré-encodée côté serveur.
+      responses:
+        '200':
+          description: Profil
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/RestaurantManagement'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+
+  /restaurant/addresses:
+    get:
+      tags: [Espace restaurant]
+      summary: Adresses du restaurant
+      operationId: listRestaurantAddresses
+      parameters:
+        - $ref: '#/components/parameters/XRestaurantId'
+      responses:
+        '200':
+          description: Adresses
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items:
+                          $ref: '#/components/schemas/Address'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+    post:
+      tags: [Espace restaurant]
+      summary: Ajouter une adresse
+      operationId: createRestaurantAddress
+      parameters:
+        - $ref: '#/components/parameters/XRestaurantId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AddressInput'
+      responses:
+        '201':
+          description: Adresse créée
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/Address'
+        '400':
+          $ref: '#/components/responses/InvalidJson'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+
+  /restaurant/addresses/{addressId}:
+    put:
+      tags: [Espace restaurant]
+      summary: Modifier une adresse
+      operationId: updateRestaurantAddress
+      parameters:
+        - $ref: '#/components/parameters/XRestaurantId'
+        - $ref: '#/components/parameters/AddressId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AddressInput'
+      responses:
+        '200':
+          description: Adresse
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/Address'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+    delete:
+      tags: [Espace restaurant]
+      summary: Supprimer une adresse
+      operationId: deleteRestaurantAddress
+      description: |
+        La dernière adresse ne peut pas être supprimée (409 LAST_ADDRESS).
+      parameters:
+        - $ref: '#/components/parameters/XRestaurantId'
+        - $ref: '#/components/parameters/AddressId'
+      responses:
+        '204':
+          description: Supprimé
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /restaurant/opening-hours:
+    get:
+      tags: [Espace restaurant]
+      summary: Horaires d'ouverture
+      operationId: listOpeningHours
+      parameters:
+        - $ref: '#/components/parameters/XRestaurantId'
+      responses:
+        '200':
+          description: Horaires
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items:
+                          $ref: '#/components/schemas/OpeningHour'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+    put:
+      tags: [Espace restaurant]
+      summary: Remplacer le planning hebdomadaire
+      operationId: replaceOpeningHours
+      description: |
+        Un jour absent est fermé. Plage passant minuit autorisée (18:00 → 02:00) ; opens_at = closes_at = ouvert 24 h/24.
+      parameters:
+        - $ref: '#/components/parameters/XRestaurantId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/OpeningHoursRequest'
+      responses:
+        '200':
+          description: Horaires
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items:
+                          $ref: '#/components/schemas/OpeningHour'
+        '400':
+          $ref: '#/components/responses/InvalidJson'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+
+  /restaurant/staff:
+    get:
+      tags: [Espace restaurant]
+      summary: Équipe du restaurant
+      operationId: listStaff
+      description: |
+        Permission : staff.view.
+      parameters:
+        - $ref: '#/components/parameters/XRestaurantId'
+      responses:
+        '200':
+          description: Membres
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items:
+                          $ref: '#/components/schemas/StaffMember'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+    post:
+      tags: [Espace restaurant]
+      summary: Ajouter un membre
+      operationId: addStaff
+      description: |
+        Compte WapiFood actif existant, désigné par son téléphone. Réservé au propriétaire.
+      parameters:
+        - $ref: '#/components/parameters/XRestaurantId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/StaffCreate'
+      responses:
+        '201':
+          description: Membre ajouté
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/StaffMember'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+
+  /restaurant/staff/{memberId}:
+    patch:
+      tags: [Espace restaurant]
+      summary: Modifier le rôle ou le statut d'un membre
+      operationId: updateStaff
+      description: |
+        Le propriétaire et son propre accès ne sont pas modifiables.
+      parameters:
+        - $ref: '#/components/parameters/XRestaurantId'
+        - $ref: '#/components/parameters/MemberId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/StaffUpdate'
+      responses:
+        '200':
+          description: Membre
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/StaffMember'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+    delete:
+      tags: [Espace restaurant]
+      summary: Retirer un membre
+      operationId: removeStaff
+      parameters:
+        - $ref: '#/components/parameters/XRestaurantId'
+        - $ref: '#/components/parameters/MemberId'
+      responses:
+        '204':
+          description: Supprimé
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /restaurant/categories:
+    get:
+      tags: [Catalogue]
+      summary: Catégories (toutes)
+      operationId: listCategories
+      description: |
+        Permission : catalog.view.
+      parameters:
+        - $ref: '#/components/parameters/XRestaurantId'
+      responses:
+        '200':
+          description: Catégories
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items:
+                          $ref: '#/components/schemas/Category'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+    post:
+      tags: [Catalogue]
+      summary: Créer une catégorie
+      operationId: createCategory
+      description: |
+        Permission : catalog.manage.
+      parameters:
+        - $ref: '#/components/parameters/XRestaurantId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CategoryInput'
+      responses:
+        '201':
+          description: Catégorie créée
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/Category'
+        '400':
+          $ref: '#/components/responses/InvalidJson'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+
+  /restaurant/categories/reorder:
+    patch:
+      tags: [Catalogue]
+      summary: Réorganiser les catégories
+      operationId: reorderCategories
+      parameters:
+        - $ref: '#/components/parameters/XRestaurantId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ReorderRequest'
+      responses:
+        '200':
+          description: Catégories dans le nouvel ordre
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items:
+                          $ref: '#/components/schemas/Category'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+
+  /restaurant/categories/{categoryId}:
+    put:
+      tags: [Catalogue]
+      summary: Modifier une catégorie
+      operationId: updateCategory
+      description: |
+        is_active = false masque la catégorie et ses produits du menu public.
+      parameters:
+        - $ref: '#/components/parameters/XRestaurantId'
+        - $ref: '#/components/parameters/CategoryId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CategoryInput'
+      responses:
+        '200':
+          description: Catégorie
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/Category'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+    delete:
+      tags: [Catalogue]
+      summary: Supprimer une catégorie vide
+      operationId: deleteCategory
+      description: |
+        Refusé si elle contient des produits (409 CATEGORY_NOT_EMPTY) : la désactiver à la place.
+      parameters:
+        - $ref: '#/components/parameters/XRestaurantId'
+        - $ref: '#/components/parameters/CategoryId'
+      responses:
+        '204':
+          description: Supprimé
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /restaurant/categories/{categoryId}/image:
+    post:
+      tags: [Catalogue]
+      summary: Remplacer l'image d'une catégorie
+      operationId: uploadCategoryImage
+      parameters:
+        - $ref: '#/components/parameters/XRestaurantId'
+        - $ref: '#/components/parameters/CategoryId'
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file]
+              properties:
+                file:
+                  type: string
+                  format: binary
+                  description: Image JPEG, PNG ou WebP (2 Mo et 4000 × 4000 px maximum). Ré-encodée côté serveur.
+      responses:
+        '200':
+          description: Catégorie
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/Category'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+
+  /restaurant/products:
+    get:
+      tags: [Catalogue]
+      summary: Produits du catalogue (y compris indisponibles)
+      operationId: listProducts
+      parameters:
+        - $ref: '#/components/parameters/XRestaurantId'
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/PerPage'
+        - $ref: '#/components/parameters/Search'
+        - $ref: '#/components/parameters/CategoryFilter'
+        - $ref: '#/components/parameters/Featured'
+        - $ref: '#/components/parameters/Available'
+      responses:
+        '200':
+          description: Liste paginée
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items:
+                          $ref: '#/components/schemas/ProductManagement'
+                      meta:
+                        $ref: '#/components/schemas/PaginationMeta'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+    post:
+      tags: [Catalogue]
+      summary: Créer un produit
+      operationId: createProduct
+      description: |
+        Devise = devise du restaurant. Prix en chaîne décimale ("8.50") ou nombre ; 2 décimales maximum.
+        Permission : catalog.manage.
+      parameters:
+        - $ref: '#/components/parameters/XRestaurantId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ProductInput'
+      responses:
+        '201':
+          description: Produit créé
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/ProductManagement'
+        '400':
+          $ref: '#/components/responses/InvalidJson'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+
+  /restaurant/products/{productId}:
+    get:
+      tags: [Catalogue]
+      summary: Détail d'un produit
+      operationId: getProduct
+      parameters:
+        - $ref: '#/components/parameters/XRestaurantId'
+        - $ref: '#/components/parameters/ProductId'
+      responses:
+        '200':
+          description: Produit
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/ProductManagement'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    put:
+      tags: [Catalogue]
+      summary: Modifier un produit
+      operationId: updateProduct
+      description: |
+        Mise à jour partielle. Si « variants » ou « option_groups » sont envoyés, ils remplacent l'existant :
+        éléments avec id mis à jour, sans id créés, absents supprimés.
+      parameters:
+        - $ref: '#/components/parameters/XRestaurantId'
+        - $ref: '#/components/parameters/ProductId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ProductInput'
+      responses:
+        '200':
+          description: Produit
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/ProductManagement'
+        '400':
+          $ref: '#/components/responses/InvalidJson'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+    delete:
+      tags: [Catalogue]
+      summary: Supprimer un produit
+      operationId: deleteProduct
+      description: |
+        Suppression logique : l'historique des commandes est conservé.
+      parameters:
+        - $ref: '#/components/parameters/XRestaurantId'
+        - $ref: '#/components/parameters/ProductId'
+      responses:
+        '204':
+          description: Supprimé
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /restaurant/products/{productId}/availability:
+    patch:
+      tags: [Catalogue]
+      summary: Rendre un produit disponible ou indisponible
+      operationId: setProductAvailability
+      description: |
+        Permission : catalog.availability (accordée aussi au personnel).
+      parameters:
+        - $ref: '#/components/parameters/XRestaurantId'
+        - $ref: '#/components/parameters/ProductId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ProductAvailabilityRequest'
+      responses:
+        '200':
+          description: Produit
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/ProductManagement'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+
+  /restaurant/products/{productId}/images:
+    post:
+      tags: [Catalogue]
+      summary: Ajouter une image
+      operationId: uploadProductImage
+      description: |
+        10 images maximum. La première devient l'image principale.
+      parameters:
+        - $ref: '#/components/parameters/XRestaurantId'
+        - $ref: '#/components/parameters/ProductId'
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file]
+              properties:
+                file:
+                  type: string
+                  format: binary
+                  description: Image JPEG, PNG ou WebP (2 Mo et 4000 × 4000 px maximum). Ré-encodée côté serveur.
+                alt_text:
+                  type: string
+                  maxLength: 180
+      responses:
+        '201':
+          description: Produit
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/ProductManagement'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+
+  /restaurant/products/{productId}/images/{imageId}:
+    delete:
+      tags: [Catalogue]
+      summary: Supprimer une image
+      operationId: deleteProductImage
+      parameters:
+        - $ref: '#/components/parameters/XRestaurantId'
+        - $ref: '#/components/parameters/ProductId'
+        - $ref: '#/components/parameters/ImageId'
+      responses:
+        '200':
+          description: Produit
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/ProductManagement'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /restaurant/orders:
+    get:
+      tags: [Commandes (restaurant)]
+      summary: Commandes reçues
+      operationId: listRestaurantOrders
+      description: |
+        Permission `orders.view`. Avec `status=active` (ou uniquement des statuts en cours), la plus ancienne d'abord
+        (file de préparation) ; sinon les plus récentes d'abord.
+      parameters:
+        - $ref: '#/components/parameters/XRestaurantId'
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/PerPage'
+        - $ref: '#/components/parameters/OrderStatusFilter'
+        - $ref: '#/components/parameters/DateFrom'
+        - $ref: '#/components/parameters/DateTo'
+        - $ref: '#/components/parameters/OrderNumberSearch'
+      responses:
+        '200':
+          description: Liste paginée
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items:
+                          $ref: '#/components/schemas/OrderSummary'
+                      meta:
+                        $ref: '#/components/schemas/PaginationMeta'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+
+  /restaurant/orders/{orderId}:
+    get:
+      tags: [Commandes (restaurant)]
+      summary: Détail d'une commande
+      operationId: showRestaurantOrder
+      description: Permission `orders.view`. `next_statuses` liste les statuts que le restaurant peut appliquer.
+      parameters:
+        - $ref: '#/components/parameters/XRestaurantId'
+        - $ref: '#/components/parameters/OrderId'
+      responses:
+        '200':
+          description: Commande
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/Order'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /restaurant/orders/{orderId}/status:
+    patch:
+      tags: [Commandes (restaurant)]
+      summary: Faire avancer une commande
+      operationId: changeRestaurantOrderStatus
+      description: |
+        Permission `orders.manage`. Transitions autorisées :
+        `pending → accepted | rejected` ; `accepted → preparing | cancelled` ; `preparing → ready` ;
+        `ready → out_for_delivery` (livraison) ou `completed` (retrait) ; `out_for_delivery → completed`.
+        Une livraison impossible s'annule par `POST …/delivery/failure`, jamais par ce changement de statut.
+
+        La livraison suit la commande (`out_for_delivery` → `in_transit`, `completed` → `delivered`). Avec `out_for_delivery`,
+        `courier_name` / `courier_phone` (facultatifs) renseignent le livreur.
+
+        `reason` est obligatoire pour `rejected` et `cancelled` (affiché au client). Un refus ou une annulation
+        annule aussi l'intention de paiement en espèces.
+
+        Erreurs : `409 INVALID_STATUS_TRANSITION` (avec `errors.allowed`), `409 ORDER_STATUS_CHANGED`
+        (modifiée entre-temps par le client : recharger), `403 RESTAURANT_SUSPENDED`.
+      parameters:
+        - $ref: '#/components/parameters/XRestaurantId'
+        - $ref: '#/components/parameters/OrderId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/OrderStatusChange'
+      responses:
+        '200':
+          description: Commande mise à jour
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/Order'
+        '400':
+          $ref: '#/components/responses/InvalidJson'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+
+  /restaurant/orders/{orderId}/cash-payment:
+    post:
+      tags: [Commandes (restaurant)]
+      summary: Enregistrer un encaissement en espèces
+      operationId: recordCashPayment
+      description: |
+        Permission `payments.record` (propriétaire, gérant, personnel, caissier). Possible quand la commande est prête,
+        en livraison ou terminée. Erreurs : `409 PAYMENT_NOT_COLLECTABLE`, `409 PAYMENT_ALREADY_RECORDED`,
+        `409 PAYMENT_METHOD_MISMATCH` (commande payée autrement qu'en espèces).
+      parameters:
+        - $ref: '#/components/parameters/XRestaurantId'
+        - $ref: '#/components/parameters/OrderId'
+      responses:
+        '200':
+          description: "Commande payée"
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/Order'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /restaurant/orders/{orderId}/delivery:
+    put:
+      tags: [Livraisons]
+      summary: Indiquer le livreur
+      operationId: assignCourier
+      description: |
+        Permission `deliveries.manage`. Le livreur du restaurant n'a pas de compte : nom (obligatoire), téléphone et note facultatifs.
+        Possible de l'acceptation jusqu'à la livraison (`pending → assigned`). Le client voit le nom et le téléphone, pas la note.
+        Erreurs : `409 DELIVERY_NOT_ASSIGNABLE`, `409 ORDER_NOT_DELIVERY` (commande à retirer).
+      parameters:
+        - $ref: '#/components/parameters/XRestaurantId'
+        - $ref: '#/components/parameters/OrderId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CourierAssignment'
+      responses:
+        '200':
+          description: "Commande avec sa livraison"
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/Order'
+        '400':
+          $ref: '#/components/responses/InvalidJson'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+
+  /restaurant/orders/{orderId}/delivery/failure:
+    post:
+      tags: [Livraisons]
+      summary: Déclarer un échec de livraison
+      operationId: failDelivery
+      description: |
+        Permission `deliveries.manage`. Commande `out_for_delivery` uniquement (`409 DELIVERY_NOT_IN_PROGRESS`).
+        La livraison passe à `failed`, la commande à `cancelled` avec le motif (communiqué au client) ; la commission et le paiement en espèces sont annulés.
+      parameters:
+        - $ref: '#/components/parameters/XRestaurantId'
+        - $ref: '#/components/parameters/OrderId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DeliveryFailureRequest'
+      responses:
+        '200':
+          description: "Commande annulée"
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/Order'
+        '400':
+          $ref: '#/components/responses/InvalidJson'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+
+  /restaurant/orders/{orderId}/delivery/proof:
+    post:
+      tags: [Livraisons]
+      summary: Ajouter une preuve de livraison
+      operationId: uploadDeliveryProof
+      description: |
+        Permission `deliveries.manage`. Photo privée (jamais servie par `/media`), une fois la commande partie (`409 DELIVERY_PROOF_NOT_ALLOWED`). Remplace la précédente.
+      parameters:
+        - $ref: '#/components/parameters/XRestaurantId'
+        - $ref: '#/components/parameters/OrderId'
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file]
+              properties:
+                file:
+                  type: string
+                  format: binary
+                  description: JPEG, PNG ou WebP (ré-encodée côté serveur)
+      responses:
+        '200':
+          description: "Commande avec sa livraison"
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/Order'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+    get:
+      tags: [Livraisons]
+      summary: Télécharger la preuve de livraison
+      operationId: getDeliveryProof
+      description: |
+        Permission `orders.view`. Réponse binaire, `Cache-Control: private, no-store`. Aucune preuve : `404 DELIVERY_PROOF_NOT_FOUND`.
+      parameters:
+        - $ref: '#/components/parameters/XRestaurantId'
+        - $ref: '#/components/parameters/OrderId'
+      responses:
+        '200':
+          description: "Image"
+          content:
+            image/jpeg:
+              schema:
+                type: string
+                format: binary
+            image/png:
+              schema:
+                type: string
+                format: binary
+            image/webp:
+              schema:
+                type: string
+                format: binary
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /restaurant/promotions:
+    get:
+      tags: [Codes promo]
+      summary: Codes promo du restaurant
+      operationId: listRestaurantPromotions
+      description: |
+        Permission `promotions.manage` (propriétaire, gérant). `usage_count` : commandes ni refusées ni annulées.
+      parameters:
+        - $ref: '#/components/parameters/XRestaurantId'
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/PerPage'
+        - $ref: '#/components/parameters/ActiveFilter'
+      responses:
+        '200':
+          description: "Codes promo"
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items:
+                          $ref: '#/components/schemas/Promotion'
+                      meta:
+                        $ref: '#/components/schemas/PaginationMeta'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+    post:
+      tags: [Codes promo]
+      summary: Créer un code promo
+      operationId: createRestaurantPromotion
+      description: |
+        Remise à la charge du restaurant (elle réduit l'assiette de la commission). Devise : celle du restaurant.
+        Code unique sur la plateforme, enregistré en majuscules (`409 PROMO_CODE_TAKEN`).
+      parameters:
+        - $ref: '#/components/parameters/XRestaurantId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PromotionInput'
+      responses:
+        '201':
+          description: "Code créé"
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/Promotion'
+        '400':
+          $ref: '#/components/responses/InvalidJson'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+
+  /restaurant/promotions/{promotionId}:
+    get:
+      tags: [Codes promo]
+      summary: Détail d'un code promo
+      operationId: showRestaurantPromotion
+      parameters:
+        - $ref: '#/components/parameters/XRestaurantId'
+        - $ref: '#/components/parameters/PromotionId'
+      responses:
+        '200':
+          description: "Code promo"
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/Promotion'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    put:
+      tags: [Codes promo]
+      summary: Modifier un code promo
+      operationId: updateRestaurantPromotion
+      description: |
+        Remplacement complet. Un code déjà utilisé ne peut plus être renommé (`409 PROMOTION_IN_USE`).
+      parameters:
+        - $ref: '#/components/parameters/XRestaurantId'
+        - $ref: '#/components/parameters/PromotionId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PromotionInput'
+      responses:
+        '200':
+          description: "Code mis à jour"
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/Promotion'
+        '400':
+          $ref: '#/components/responses/InvalidJson'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+    delete:
+      tags: [Codes promo]
+      summary: Supprimer un code promo
+      operationId: deleteRestaurantPromotion
+      description: |
+        Seulement s'il n'a jamais été utilisé ; sinon `409 PROMOTION_IN_USE` (le désactiver).
+      parameters:
+        - $ref: '#/components/parameters/XRestaurantId'
+        - $ref: '#/components/parameters/PromotionId'
+      responses:
+        '204':
+          description: "Code supprimé"
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /restaurant/promotions/{promotionId}/status:
+    patch:
+      tags: [Codes promo]
+      summary: Activer ou désactiver un code promo
+      operationId: setRestaurantPromotionStatus
+      parameters:
+        - $ref: '#/components/parameters/XRestaurantId'
+        - $ref: '#/components/parameters/PromotionId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PromotionStatusRequest'
+      responses:
+        '200':
+          description: "Code mis à jour"
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/Promotion'
+        '400':
+          $ref: '#/components/responses/InvalidJson'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+
+  /restaurant/reviews:
+    get:
+      tags: [Avis]
+      summary: Avis reçus par le restaurant
+      operationId: listOwnReviews
+      description: |
+        Permission `restaurant.view`. Avis masqués compris, avec leur statut. `meta.rating` : note publique (avis publiés).
+      parameters:
+        - $ref: '#/components/parameters/XRestaurantId'
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/PerPage'
+        - $ref: '#/components/parameters/ReviewStatusFilter'
+        - $ref: '#/components/parameters/RatingFilter'
+      responses:
+        '200':
+          description: "Avis"
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items:
+                          $ref: '#/components/schemas/Review'
+                      meta:
+                        allOf:
+                          - $ref: '#/components/schemas/PaginationMeta'
+                          - type: object
+                            properties:
+                              rating:
+                                $ref: '#/components/schemas/RatingSummary'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+
+  /restaurant/notifications:
+    get:
+      tags: [Notifications]
+      summary: Notifications du restaurant
+      operationId: listRestaurantNotifications
+      description: |
+        Notifications in-app, plus récentes d'abord. `meta.unread_count` : nombre de non lues.
+        Permission `orders.view`. Boîte partagée par l'équipe : une notification lue l'est pour tous.
+      parameters:
+        - $ref: '#/components/parameters/XRestaurantId'
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/PerPage'
+        - $ref: '#/components/parameters/UnreadFilter'
+      responses:
+        '200':
+          description: "Notifications"
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items:
+                          $ref: '#/components/schemas/Notification'
+                      meta:
+                        allOf:
+                          - $ref: '#/components/schemas/PaginationMeta'
+                          - type: object
+                            properties:
+                              unread_count:
+                                type: integer
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+
+  /restaurant/notifications/read-all:
+    post:
+      tags: [Notifications]
+      summary: Tout marquer comme lu (restaurant)
+      operationId: readAllRestaurantNotifications
+      parameters:
+        - $ref: '#/components/parameters/XRestaurantId'
+      responses:
+        '200':
+          description: "Nombre de notifications marquées"
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/ReadAllResult'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /restaurant/notifications/{notificationId}/read:
+    patch:
+      tags: [Notifications]
+      summary: Marquer une notification du restaurant comme lue
+      operationId: readRestaurantNotification
+      parameters:
+        - $ref: '#/components/parameters/XRestaurantId'
+        - $ref: '#/components/parameters/NotificationId'
+      responses:
+        '200':
+          description: "Notification lue"
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/Notification'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /restaurant/finance:
+    get:
+      tags: [Finances]
+      summary: Commission due à WapiFood
+      operationId: restaurantBalances
+      description: |
+        Permission `finance.view` (propriétaire uniquement). `commission_due` : commission des commandes terminées,
+        non encore réglée. `commission_pending` : commission des commandes en cours (pas encore due).
+      parameters:
+        - $ref: '#/components/parameters/XRestaurantId'
+      responses:
+        '200':
+          description: "Une ligne par devise"
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items:
+                          $ref: '#/components/schemas/FinanceBalance'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /restaurant/finance/ledger:
+    get:
+      tags: [Finances]
+      summary: Journal financier du restaurant
+      operationId: restaurantLedger
+      description: |
+        Permission `finance.view`. Écritures immuables ; montant positif = augmente la dette envers WapiFood.
+      parameters:
+        - $ref: '#/components/parameters/XRestaurantId'
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/PerPage'
+        - $ref: '#/components/parameters/CurrencyFilter'
+      responses:
+        '200':
+          description: "Écritures, plus récentes d'abord"
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items:
+                          $ref: '#/components/schemas/LedgerEntry'
+                      meta:
+                        $ref: '#/components/schemas/PaginationMeta'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+
+  /customer/addresses:
+    get:
+      tags: [Espace client]
+      summary: Mes adresses de livraison
+      operationId: listCustomerAddresses
+      responses:
+        '200':
+          description: Adresses (par défaut en premier)
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items:
+                          $ref: '#/components/schemas/CustomerAddress'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+    post:
+      tags: [Espace client]
+      summary: Ajouter une adresse
+      operationId: createCustomerAddress
+      description: |
+        20 adresses au maximum (`409 ADDRESS_LIMIT_REACHED`). La première adresse devient l'adresse par défaut.
+        Destinataire et téléphone : ceux du compte s'ils ne sont pas précisés.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CustomerAddressInput'
+      responses:
+        '201':
+          description: Adresse créée
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/CustomerAddress'
+        '400':
+          $ref: '#/components/responses/InvalidJson'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+
+  /customer/addresses/{addressId}:
+    get:
+      tags: [Espace client]
+      summary: Détail d'une adresse
+      operationId: showCustomerAddress
+      parameters:
+        - $ref: '#/components/parameters/AddressId'
+      responses:
+        '200':
+          description: Adresse
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/CustomerAddress'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    put:
+      tags: [Espace client]
+      summary: Modifier une adresse
+      operationId: updateCustomerAddress
+      parameters:
+        - $ref: '#/components/parameters/AddressId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CustomerAddressInput'
+      responses:
+        '200':
+          description: Adresse
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/CustomerAddress'
+        '400':
+          $ref: '#/components/responses/InvalidJson'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+    delete:
+      tags: [Espace client]
+      summary: Supprimer une adresse
+      operationId: deleteCustomerAddress
+      description: |
+        Suppression logique : les commandes passées conservent leur propre copie de l'adresse.
+        Si l'adresse était celle par défaut, la plus récente des autres le devient.
+      parameters:
+        - $ref: '#/components/parameters/AddressId'
+      responses:
+        '204':
+          description: Supprimée
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /customer/favorites:
+    get:
+      tags: [Espace client]
+      summary: Mes restaurants favoris
+      operationId: listFavorites
+      description: |
+        Les restaurants qui ne sont plus visibles (suspendus…) sont masqués.
+      parameters:
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/PerPage'
+      responses:
+        '200':
+          description: Liste paginée
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items:
+                          $ref: '#/components/schemas/RestaurantSummary'
+                      meta:
+                        $ref: '#/components/schemas/PaginationMeta'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+
+  /customer/favorites/{restaurantId}:
+    put:
+      tags: [Espace client]
+      summary: Ajouter un favori
+      operationId: addFavorite
+      parameters:
+        - $ref: '#/components/parameters/RestaurantId'
+      responses:
+        '204':
+          description: Ajouté (idempotent)
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    delete:
+      tags: [Espace client]
+      summary: Retirer un favori
+      operationId: removeFavorite
+      parameters:
+        - $ref: '#/components/parameters/RestaurantId'
+      responses:
+        '204':
+          description: Retiré (idempotent)
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /customer/orders/quote:
+    post:
+      tags: [Espace client]
+      summary: Calculer un panier
+      operationId: quoteOrder
+      description: |
+        Mêmes contrôles que la création de commande, sans rien enregistrer. Utile pour afficher le total exact avant confirmation.
+        Limite : 60 requêtes / 60 s par compte.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/OrderRequest'
+      responses:
+        '200':
+          description: Panier calculé
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/OrderQuote'
+        '400':
+          $ref: '#/components/responses/InvalidJson'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+
+  /customer/orders:
+    get:
+      tags: [Espace client]
+      summary: Mes commandes
+      operationId: listCustomerOrders
+      parameters:
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/PerPage'
+        - $ref: '#/components/parameters/OrderStatusFilter'
+      responses:
+        '200':
+          description: Liste paginée (plus récentes d'abord)
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items:
+                          $ref: '#/components/schemas/OrderSummary'
+                      meta:
+                        $ref: '#/components/schemas/PaginationMeta'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+    post:
+      tags: [Espace client]
+      summary: Passer une commande
+      operationId: createOrder
+      description: |
+        Tous les montants sont recalculés côté serveur à partir du catalogue : seuls les identifiants et quantités sont lus.
+        Le restaurant doit être actif et ouvert (maintenant, ou à `requested_for`).
+
+        Codes d'erreur (`meta.code`) :
+        - `404 RESTAURANT_NOT_FOUND` : restaurant inexistant ou non visible.
+        - `409 RESTAURANT_CLOSED` : fermé temporairement, ou hors horaires.
+        - `422 ORDER_TYPE_UNAVAILABLE` : livraison ou retrait non proposé.
+        - `422 PAYMENT_METHOD_UNAVAILABLE` : seul `cash` est accepté pour le moment.
+        - `422 ORDER_ITEMS_INVALID` : article introuvable, indisponible, variante ou options invalides (détail par ligne dans `errors`, ex. `items.0.option_ids`).
+        - `422 MINIMUM_ORDER_NOT_REACHED` : `errors.minimum_order_amount` et `errors.subtotal`.
+        - `409 PRICE_CHANGED` : `expected_total` différent du total recalculé (`errors.total_amount`).
+        - `409 IDEMPOTENCY_KEY_REUSED` : clé déjà utilisée pour une commande d'un autre restaurant.
+
+        Limite : 20 commandes / 10 min par compte.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/OrderRequest'
+      responses:
+        '201':
+          description: Commande créée
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/Order'
+        '200':
+          description: "Commande déjà enregistrée avec cette clé d'idempotence (en-tête `Idempotent-Replayed: true`)"
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/Order'
+        '400':
+          $ref: '#/components/responses/InvalidJson'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+
+  /customer/orders/{orderId}:
+    get:
+      tags: [Espace client]
+      summary: Détail d'une commande
+      operationId: showCustomerOrder
+      parameters:
+        - $ref: '#/components/parameters/OrderId'
+      responses:
+        '200':
+          description: Commande
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/Order'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /customer/orders/{orderId}/cancel:
+    post:
+      tags: [Espace client]
+      summary: Annuler une commande
+      operationId: cancelCustomerOrder
+      description: |
+        Possible uniquement tant que le restaurant n'a pas accepté la commande (sinon `409 ORDER_NOT_CANCELLABLE`).
+      parameters:
+        - $ref: '#/components/parameters/OrderId'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CancelRequest'
+      responses:
+        '200':
+          description: Commande annulée
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/Order'
+        '400':
+          $ref: '#/components/responses/InvalidJson'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+
+  /customer/orders/{orderId}/review:
+    post:
+      tags: [Avis]
+      summary: Donner son avis sur une commande
+      operationId: createReview
+      description: |
+        Commande terminée du client (`409 ORDER_NOT_COMPLETED`), dans les 30 jours (`409 REVIEW_WINDOW_CLOSED`), un seul avis par commande
+        (`409 REVIEW_ALREADY_EXISTS`). Publié immédiatement (modération a posteriori). Ni modification ni suppression.
+        Limite : 20 avis par heure et par client.
+      parameters:
+        - $ref: '#/components/parameters/OrderId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ReviewRequest'
+      responses:
+        '201':
+          description: "Avis publié"
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/Review'
+        '400':
+          $ref: '#/components/responses/InvalidJson'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+
+  /customer/reviews:
+    get:
+      tags: [Avis]
+      summary: Mes avis
+      operationId: listMyReviews
+      parameters:
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/PerPage'
+      responses:
+        '200':
+          description: "Avis du client"
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items:
+                          $ref: '#/components/schemas/Review'
+                      meta:
+                        $ref: '#/components/schemas/PaginationMeta'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+
+  /admin/restaurants:
+    get:
+      tags: [Administration]
+      summary: Restaurants (toutes les fiches)
+      operationId: adminListRestaurants
+      description: |
+        File de validation : restaurants « pending » d'abord, les plus anciens en premier. Rôle super_admin.
+      parameters:
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/PerPage'
+        - $ref: '#/components/parameters/Search'
+        - $ref: '#/components/parameters/StatusFilter'
+      responses:
+        '200':
+          description: Liste paginée
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items:
+                          $ref: '#/components/schemas/RestaurantAdmin'
+                      meta:
+                        $ref: '#/components/schemas/PaginationMeta'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+
+  /admin/restaurants/{restaurantId}:
+    get:
+      tags: [Administration]
+      summary: Fiche d'administration
+      operationId: adminGetRestaurant
+      parameters:
+        - $ref: '#/components/parameters/RestaurantId'
+      responses:
+        '200':
+          description: Restaurant
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/RestaurantAdmin'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /admin/restaurants/{restaurantId}/approve:
+    patch:
+      tags: [Administration]
+      summary: Valider un restaurant
+      operationId: adminRestaurantApprove
+      description: |
+        pending → active.
+      parameters:
+        - $ref: '#/components/parameters/RestaurantId'
+      responses:
+        '200':
+          description: Restaurant
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/RestaurantAdmin'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+
+  /admin/restaurants/{restaurantId}/reject:
+    patch:
+      tags: [Administration]
+      summary: Refuser un restaurant
+      operationId: adminRestaurantReject
+      description: |
+        pending → rejected ; le motif est communiqué au restaurateur.
+      parameters:
+        - $ref: '#/components/parameters/RestaurantId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ReasonRequest'
+      responses:
+        '200':
+          description: Restaurant
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/RestaurantAdmin'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+
+  /admin/restaurants/{restaurantId}/suspend:
+    patch:
+      tags: [Administration]
+      summary: Suspendre un restaurant
+      operationId: adminRestaurantSuspend
+      description: |
+        active | paused → suspended : invisible et en lecture seule pour son équipe.
+      parameters:
+        - $ref: '#/components/parameters/RestaurantId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ReasonRequest'
+      responses:
+        '200':
+          description: Restaurant
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/RestaurantAdmin'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+
+  /admin/restaurants/{restaurantId}/reactivate:
+    patch:
+      tags: [Administration]
+      summary: Réactiver un restaurant suspendu
+      operationId: adminRestaurantReactivate
+      description: |
+        suspended → active.
+      parameters:
+        - $ref: '#/components/parameters/RestaurantId'
+      responses:
+        '200':
+          description: Restaurant
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/RestaurantAdmin'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+
+  /admin/restaurants/{restaurantId}/commission:
+    patch:
+      tags: [Administration]
+      summary: Modifier le taux de commission
+      operationId: adminRestaurantCommission
+      description: |
+        Entre 0 et 100 %. S'applique aux commandes futures uniquement.
+      parameters:
+        - $ref: '#/components/parameters/RestaurantId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CommissionRequest'
+      responses:
+        '200':
+          description: Restaurant
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/RestaurantAdmin'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+
+  /admin/finance/balances:
+    get:
+      tags: [Administration]
+      summary: Commissions dues par restaurant
+      operationId: adminBalances
+      parameters:
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/PerPage'
+        - $ref: '#/components/parameters/CurrencyFilter'
+        - $ref: '#/components/parameters/OnlyDue'
+      responses:
+        '200':
+          description: "Liste paginée (plus gros soldes d'abord)"
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items:
+                          $ref: '#/components/schemas/AdminBalance'
+                      meta:
+                        $ref: '#/components/schemas/PaginationMeta'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+
+  /admin/restaurants/{restaurantId}/ledger:
+    get:
+      tags: [Administration]
+      summary: Journal financier d'un restaurant
+      operationId: adminLedger
+      parameters:
+        - $ref: '#/components/parameters/RestaurantId'
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/PerPage'
+        - $ref: '#/components/parameters/CurrencyFilter'
+      responses:
+        '200':
+          description: "Écritures"
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items:
+                          $ref: '#/components/schemas/LedgerEntry'
+                      meta:
+                        $ref: '#/components/schemas/PaginationMeta'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+
+  /admin/restaurants/{restaurantId}/settlements:
+    post:
+      tags: [Administration]
+      summary: Enregistrer un règlement de commission
+      operationId: recordSettlement
+      description: |
+        Le restaurant a payé tout ou partie de sa commission. Ne peut pas dépasser le montant dû (`409 SETTLEMENT_EXCEEDS_DUE`).
+      parameters:
+        - $ref: '#/components/parameters/RestaurantId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SettlementRequest'
+      responses:
+        '201':
+          description: "Écriture créée"
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/LedgerEntry'
+        '400':
+          $ref: '#/components/responses/InvalidJson'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+
+  /admin/restaurants/{restaurantId}/adjustments:
+    post:
+      tags: [Administration]
+      summary: Ajustement manuel motivé
+      operationId: recordAdjustment
+      description: |
+        Montant signé : positif = augmente la dette du restaurant, négatif = la diminue. Motif obligatoire.
+      parameters:
+        - $ref: '#/components/parameters/RestaurantId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AdjustmentRequest'
+      responses:
+        '201':
+          description: "Écriture créée"
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/LedgerEntry'
+        '400':
+          $ref: '#/components/responses/InvalidJson'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+
+  /admin/orders/{orderId}:
+    get:
+      tags: [Administration]
+      summary: Détail d'une commande (support)
+      operationId: adminShowOrder
+      parameters:
+        - $ref: '#/components/parameters/OrderId'
+      responses:
+        '200':
+          description: "Commande avec remboursements"
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/AdminOrder'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /admin/orders/{orderId}/refunds:
+    post:
+      tags: [Administration]
+      summary: Enregistrer un remboursement
+      operationId: recordRefund
+      description: |
+        Remboursement effectué hors ligne (espèces). Plusieurs remboursements partiels possibles, jamais plus que le montant payé
+        (`422 REFUND_EXCEEDS_PAID`). Commande non payée : `409 PAYMENT_NOT_REFUNDABLE`.
+        Remboursement total : la commission est annulée (écriture `commission_reversed`). Partiel : commission inchangée.
+      parameters:
+        - $ref: '#/components/parameters/OrderId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RefundRequest'
+      responses:
+        '201':
+          description: "Remboursement enregistré"
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/RefundResult'
+        '400':
+          $ref: '#/components/responses/InvalidJson'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+
+  /admin/orders/{orderId}/delivery/proof:
+    get:
+      tags: [Administration]
+      summary: Preuve de livraison (support)
+      operationId: adminDeliveryProof
+      parameters:
+        - $ref: '#/components/parameters/OrderId'
+      responses:
+        '200':
+          description: "Image"
+          content:
+            image/jpeg:
+              schema:
+                type: string
+                format: binary
+            image/png:
+              schema:
+                type: string
+                format: binary
+            image/webp:
+              schema:
+                type: string
+                format: binary
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /admin/promotions:
+    get:
+      tags: [Administration]
+      summary: Codes promo plateforme
+      operationId: listPlatformPromotions
+      parameters:
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/PerPage'
+        - $ref: '#/components/parameters/ActiveFilter'
+      responses:
+        '200':
+          description: "Codes plateforme"
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items:
+                          $ref: '#/components/schemas/Promotion'
+                      meta:
+                        $ref: '#/components/schemas/PaginationMeta'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+    post:
+      tags: [Administration]
+      summary: Créer un code promo plateforme
+      operationId: createPlatformPromotion
+      description: |
+        Remise à la charge de WapiFood : la commission est calculée avant remise, et le restaurant est crédité de la remise
+        (écriture `platform_discount`) quand la commande est terminée. `currency` obligatoire si le code contient un montant
+        (remise fixe, minimum ou plafond) ; sans devise, un pourcentage s'applique dans toutes les devises.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PromotionInput'
+      responses:
+        '201':
+          description: "Code créé"
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/Promotion'
+        '400':
+          $ref: '#/components/responses/InvalidJson'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+
+  /admin/promotions/{promotionId}:
+    get:
+      tags: [Administration]
+      summary: Détail d'un code plateforme
+      operationId: showPlatformPromotion
+      parameters:
+        - $ref: '#/components/parameters/PromotionId'
+      responses:
+        '200':
+          description: "Code promo"
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/Promotion'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    put:
+      tags: [Administration]
+      summary: Modifier un code plateforme
+      operationId: updatePlatformPromotion
+      description: |
+        Mêmes règles que pour un code restaurant.
+      parameters:
+        - $ref: '#/components/parameters/PromotionId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PromotionInput'
+      responses:
+        '200':
+          description: "Code mis à jour"
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/Promotion'
+        '400':
+          $ref: '#/components/responses/InvalidJson'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+    delete:
+      tags: [Administration]
+      summary: Supprimer un code plateforme
+      operationId: deletePlatformPromotion
+      description: |
+        Seulement s'il n'a jamais été utilisé.
+      parameters:
+        - $ref: '#/components/parameters/PromotionId'
+      responses:
+        '204':
+          description: "Code supprimé"
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /admin/promotions/{promotionId}/status:
+    patch:
+      tags: [Administration]
+      summary: Activer ou désactiver un code plateforme
+      operationId: setPlatformPromotionStatus
+      parameters:
+        - $ref: '#/components/parameters/PromotionId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PromotionStatusRequest'
+      responses:
+        '200':
+          description: "Code mis à jour"
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/Promotion'
+        '400':
+          $ref: '#/components/responses/InvalidJson'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+
+  /admin/reviews:
+    get:
+      tags: [Administration]
+      summary: Avis (modération)
+      operationId: adminListReviews
+      parameters:
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/PerPage'
+        - $ref: '#/components/parameters/ReviewStatusFilter'
+        - $ref: '#/components/parameters/RatingFilter'
+        - $ref: '#/components/parameters/RestaurantFilter'
+      responses:
+        '200':
+          description: "Avis"
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items:
+                          $ref: '#/components/schemas/AdminReview'
+                      meta:
+                        $ref: '#/components/schemas/PaginationMeta'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+
+  /admin/reviews/{reviewId}/moderation:
+    patch:
+      tags: [Administration]
+      summary: Masquer ou republier un avis
+      operationId: moderateReview
+      description: |
+        Un avis masqué disparaît de la fiche publique et de la note moyenne. Motif obligatoire pour masquer. Action tracée dans le journal d'audit.
+      parameters:
+        - $ref: '#/components/parameters/ReviewId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ModerationRequest'
+      responses:
+        '200':
+          description: "Avis modéré"
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/AdminReview'
+        '400':
+          $ref: '#/components/responses/InvalidJson'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+
+  /admin/notifications:
+    get:
+      tags: [Administration]
+      summary: File des notifications
+      operationId: adminListNotifications
+      description: |
+        Supervision des envois (tous canaux). Filtres : `status`, `channel`, `type` (ex. `order.accepted`).
+      parameters:
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/PerPage'
+        - $ref: '#/components/parameters/NotificationStatusFilter'
+        - $ref: '#/components/parameters/NotificationChannelFilter'
+        - $ref: '#/components/parameters/NotificationTypeFilter'
+      responses:
+        '200':
+          description: "Notifications"
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items:
+                          $ref: '#/components/schemas/AdminNotification'
+                      meta:
+                        $ref: '#/components/schemas/PaginationMeta'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+
+  /admin/notifications/{notificationId}:
+    get:
+      tags: [Administration]
+      summary: Détail d'une notification
+      operationId: adminShowNotification
+      description: |
+        Avec l'historique des tentatives d'envoi.
+      parameters:
+        - $ref: '#/components/parameters/NotificationId'
+      responses:
+        '200':
+          description: "Notification"
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/AdminNotificationDetail'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /admin/notifications/{notificationId}/retry:
+    post:
+      tags: [Administration]
+      summary: Renvoyer une notification en échec
+      operationId: adminRetryNotification
+      description: |
+        Remet en file une notification `failed` avec de nouvelles tentatives (historique conservé). Autre statut : `409 NOTIFICATION_NOT_FAILED`.
+      parameters:
+        - $ref: '#/components/parameters/NotificationId'
+      responses:
+        '200':
+          description: "Notification remise en file"
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/AdminNotificationDetail'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+components:
+  parameters:
+    RestaurantId:
+      name: restaurantId
+      in: path
+      required: true
+      schema:
+        type: integer
+        minimum: 1
+    ProductId:
+      name: productId
+      in: path
+      required: true
+      schema:
+        type: integer
+        minimum: 1
+    CategoryId:
+      name: categoryId
+      in: path
+      required: true
+      schema:
+        type: integer
+        minimum: 1
+    AddressId:
+      name: addressId
+      in: path
+      required: true
+      schema:
+        type: integer
+        minimum: 1
+    MemberId:
+      name: memberId
+      in: path
+      required: true
+      schema:
+        type: integer
+        minimum: 1
+    ImageId:
+      name: imageId
+      in: path
+      required: true
+      schema:
+        type: integer
+        minimum: 1
+    XRestaurantId:
+      name: X-Restaurant-Id
+      in: header
+      required: false
+      description: Restaurant ciblé, obligatoire si l'utilisateur appartient à plusieurs restaurants (403 RESTAURANT_REQUIRED sinon).
+      schema:
+        type: integer
+        minimum: 1
+    Page:
+      name: page
+      in: query
+      required: false
+      description: Numéro de page (1 par défaut)
+      schema:
+        type: integer
+        minimum: 1
+    PerPage:
+      name: per_page
+      in: query
+      required: false
+      description: Éléments par page (20 par défaut, 100 maximum)
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 100
+    Search:
+      name: q
+      in: query
+      required: false
+      description: Recherche textuelle (nom)
+      schema:
+        type: string
+    City:
+      name: city
+      in: query
+      required: false
+      description: Ville (ex. Kinshasa)
+      schema:
+        type: string
+    Commune:
+      name: commune
+      in: query
+      required: false
+      description: Commune (ex. Gombe)
+      schema:
+        type: string
+    Featured:
+      name: featured
+      in: query
+      required: false
+      description: Uniquement les éléments mis en avant
+      schema:
+        type: boolean
+    Delivery:
+      name: delivery
+      in: query
+      required: false
+      description: Uniquement les restaurants qui livrent
+      schema:
+        type: boolean
+    Pickup:
+      name: pickup
+      in: query
+      required: false
+      description: Uniquement les restaurants avec retrait sur place
+      schema:
+        type: boolean
+    Available:
+      name: available
+      in: query
+      required: false
+      description: Filtrer sur la disponibilité
+      schema:
+        type: boolean
+    CategoryFilter:
+      name: category_id
+      in: query
+      required: false
+      description: Filtrer sur une catégorie
+      schema:
+        type: integer
+    StatusFilter:
+      name: status
+      in: query
+      required: false
+      description: Statut du restaurant
+      schema:
+        type: string
+        enum: [pending, active, paused, rejected, suspended]
+    OrderId:
+      name: orderId
+      in: path
+      required: true
+      schema:
+        type: integer
+        minimum: 1
+    OrderStatusFilter:
+      name: status
+      in: query
+      required: false
+      description: |
+        Un ou plusieurs statuts séparés par des virgules (`pending,accepted`), ou `active` pour les commandes en cours
+        (pending, accepted, preparing, ready, out_for_delivery).
+      schema:
+        type: string
+        example: active
+    DateFrom:
+      name: date_from
+      in: query
+      required: false
+      description: Commandes créées à partir de ce jour (UTC, AAAA-MM-JJ)
+      schema:
+        type: string
+        format: date
+    DateTo:
+      name: date_to
+      in: query
+      required: false
+      description: Commandes créées jusqu'à ce jour inclus (UTC, AAAA-MM-JJ)
+      schema:
+        type: string
+        format: date
+    OrderNumberSearch:
+      name: q
+      in: query
+      required: false
+      description: Numéro de commande (recherche partielle)
+      schema:
+        type: string
+        maxLength: 40
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: false
+      description: |
+        Recommandé. Identifiant unique généré par l'application pour ce panier (8 à 64 caractères : lettres, chiffres, `-`, `_`).
+        En cas de nouvel envoi (réseau instable, double appui), la commande déjà créée est renvoyée au lieu d'en créer une seconde.
+      schema:
+        type: string
+        pattern: '^[A-Za-z0-9_-]{8,64}$'
+        example: 3f2b9c1e-7a44-4d0e-9b1a-2c5d8e6f0a11
+    CurrencyFilter:
+      name: currency
+      in: query
+      required: false
+      schema:
+        type: string
+        enum: [USD, CDF]
+    OnlyDue:
+      name: only_due
+      in: query
+      required: false
+      description: Seulement les soldes strictement positifs
+      schema:
+        type: boolean
+    Provider:
+      name: provider
+      in: path
+      required: true
+      schema:
+        type: string
+        example: mpesa
+    PromotionId:
+      name: promotionId
+      in: path
+      required: true
+      schema:
+        type: integer
+        minimum: 1
+    ReviewId:
+      name: reviewId
+      in: path
+      required: true
+      schema:
+        type: integer
+        minimum: 1
+    ActiveFilter:
+      name: active
+      in: query
+      description: true = codes actifs, false = codes désactivés
+      schema:
+        type: boolean
+    ReviewStatusFilter:
+      name: status
+      in: query
+      schema:
+        type: string
+        enum: [published, hidden, pending]
+    RatingFilter:
+      name: rating
+      in: query
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 5
+    RestaurantFilter:
+      name: restaurant_id
+      in: query
+      schema:
+        type: integer
+        minimum: 1
+    NotificationId:
+      name: notificationId
+      in: path
+      required: true
+      schema:
+        type: integer
+        minimum: 1
+    UnreadFilter:
+      name: unread
+      in: query
+      description: true = non lues uniquement
+      schema:
+        type: boolean
+    NotificationStatusFilter:
+      name: status
+      in: query
+      schema:
+        type: string
+        enum: [queued, sent, failed, read]
+    NotificationChannelFilter:
+      name: channel
+      in: query
+      schema:
+        type: string
+        enum: [in_app, email, sms, whatsapp, push]
+    NotificationTypeFilter:
+      name: type
+      in: query
+      schema:
+        type: string
+        example: order.accepted
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  schemas:
+    SuccessEnvelope:
+      type: object
+      required: [success, message, data, meta]
+      properties:
+        success:
+          type: boolean
+          enum: [true]
+        message:
+          type: string
+        data:
+          description: Contenu de la réponse (objet ou liste)
+        meta:
+          type: object
+          nullable: true
+          description: Pagination ou informations complémentaires
+
+    ErrorEnvelope:
+      type: object
+      required: [success, message, errors, meta]
+      properties:
+        success:
+          type: boolean
+          enum: [false]
+        message:
+          type: string
+        errors:
+          type: object
+          additionalProperties: true
+          description: Erreurs par champ (validation) ou par règle ; objet vide si aucune
+        meta:
+          type: object
+          nullable: true
+          properties:
+            code:
+              type: string
+              description: Code d'erreur stable (ex. VALIDATION_FAILED, RATE_LIMITED)
+
+    Health:
+      type: object
+      required: [status, service, api_version, time, checks]
+      properties:
+        status:
+          type: string
+          enum: [ok, degraded]
+        service:
+          type: string
+        api_version:
+          type: string
+        time:
+          type: string
+          format: date-time
+        checks:
+          type: object
+          properties:
+            database:
+              type: string
+              enum: [ok, unavailable]
+
+    RegisterRequest:
+      type: object
+      required: [first_name, phone, password, account_type]
+      properties:
+        first_name:
+          type: string
+          maxLength: 100
+        last_name:
+          type: string
+          maxLength: 100
+          nullable: true
+        email:
+          type: string
+          format: email
+          maxLength: 190
+          nullable: true
+        phone:
+          type: string
+          description: Numéro congolais (0812345678, 812345678, +243812345678) ou international (+XXXXXXXX)
+        password:
+          type: string
+          minLength: 10
+          maxLength: 128
+        account_type:
+          type: string
+          enum: [customer, restaurant_owner]
+
+    LoginRequest:
+      type: object
+      required: [identifier, password]
+      properties:
+        identifier:
+          type: string
+          description: Téléphone ou e-mail
+        password:
+          type: string
+
+    CodeRequest:
+      type: object
+      required: [code]
+      properties:
+        code:
+          type: string
+          pattern: '^\d{4,8}$'
+
+    User:
+      type: object
+      properties:
+        id:
+          type: integer
+        first_name:
+          type: string
+        last_name:
+          type: string
+          nullable: true
+        email:
+          type: string
+          nullable: true
+        phone:
+          type: string
+          description: Format E.164
+          example: '+243812345678'
+        avatar_url:
+          type: string
+          nullable: true
+        status:
+          type: string
+          enum: [pending, active, suspended, deleted]
+        phone_verified:
+          type: boolean
+        email_verified:
+          type: boolean
+        roles:
+          type: array
+          items:
+            type: string
+            enum: [customer, restaurant_owner, restaurant_staff, courier, super_admin]
+        created_at:
+          type: string
+          format: date-time
+        last_login_at:
+          type: string
+          format: date-time
+          nullable: true
+
+    Tokens:
+      type: object
+      properties:
+        token_type:
+          type: string
+          enum: [Bearer]
+        access_token:
+          type: string
+        expires_in:
+          type: integer
+          description: Durée de vie du jeton d'accès, en secondes
+          example: 900
+        refresh_token:
+          type: string
+          description: À conserver de façon sécurisée ; à usage unique
+        refresh_expires_in:
+          type: integer
+          example: 2592000
+
+    Session:
+      type: object
+      properties:
+        id:
+          type: string
+        current:
+          type: boolean
+        ip_address:
+          type: string
+          nullable: true
+        user_agent:
+          type: string
+          nullable: true
+        started_at:
+          type: string
+          format: date-time
+        last_refreshed:
+          type: string
+          format: date-time
+        expires_at:
+          type: string
+          format: date-time
+
+    PaginationMeta:
+      type: object
+      properties:
+        pagination:
+          type: object
+          properties:
+            page:
+              type: integer
+            per_page:
+              type: integer
+            total:
+              type: integer
+            total_pages:
+              type: integer
+
+    Money:
+      type: string
+      description: Montant décimal en chaîne, 2 décimales (jamais de nombre flottant côté API)
+      pattern: '^-?\d{1,10}\.\d{2}$'
+      example: '8.50'
+
+    RestaurantSummary:
+      type: object
+      properties:
+        id:
+          type: integer
+        name:
+          type: string
+        slug:
+          type: string
+        description:
+          type: string
+          nullable: true
+        logo_url:
+          type: string
+          nullable: true
+        cover_url:
+          type: string
+          nullable: true
+        currency:
+          type: string
+          enum: [USD, CDF]
+        minimum_order_amount:
+          $ref: '#/components/schemas/Money'
+        average_preparation_minutes:
+          type: integer
+        accepts_delivery:
+          type: boolean
+        accepts_pickup:
+          type: boolean
+        delivery_fee:
+          $ref: '#/components/schemas/Money'
+        free_delivery_threshold:
+          allOf:
+            - $ref: '#/components/schemas/Money'
+          nullable: true
+          description: Sous-total à partir duquel la livraison est offerte (null = jamais)
+        is_featured:
+          type: boolean
+        is_paused:
+          type: boolean
+          description: Fermé temporairement par le restaurant
+        is_open_now:
+          type: boolean
+          description: Ouvert à l'instant (horaires, fuseau du restaurant, statut)
+        rating:
+          $ref: '#/components/schemas/RatingSummary'
+        location:
+          type: object
+          nullable: true
+          properties:
+            commune:
+              type: string
+              nullable: true
+            city:
+              type: string
+
+    RestaurantPublic:
+      allOf:
+        - $ref: '#/components/schemas/RestaurantSummary'
+        - type: object
+          properties:
+            phone:
+              type: string
+            address:
+              $ref: '#/components/schemas/Address'
+            opening_hours:
+              type: array
+              items:
+                $ref: '#/components/schemas/OpeningHour'
+            timezone:
+              type: string
+
+    RestaurantManagement:
+      allOf:
+        - $ref: '#/components/schemas/RestaurantSummary'
+        - type: object
+          properties:
+            phone:
+              type: string
+            email:
+              type: string
+              nullable: true
+            status:
+              type: string
+              enum: [pending, active, paused, rejected, suspended]
+            status_reason:
+              type: string
+              nullable: true
+              description: Motif du refus ou de la suspension
+            commission_rate:
+              $ref: '#/components/schemas/Money'
+            delivery_managed_by:
+              type: string
+              enum: [restaurant, wapifood, both]
+            timezone:
+              type: string
+              enum: [Africa/Kinshasa, Africa/Lubumbashi]
+            addresses:
+              type: array
+              items:
+                $ref: '#/components/schemas/Address'
+            opening_hours:
+              type: array
+              items:
+                $ref: '#/components/schemas/OpeningHour'
+            approved_at:
+              type: string
+              format: date-time
+              nullable: true
+            created_at:
+              type: string
+              format: date-time
+            updated_at:
+              type: string
+              format: date-time
+
+    RestaurantAdmin:
+      allOf:
+        - $ref: '#/components/schemas/RestaurantManagement'
+        - type: object
+          properties:
+            owner:
+              type: object
+              properties:
+                id:
+                  type: integer
+                first_name:
+                  type: string
+                last_name:
+                  type: string
+                  nullable: true
+                phone:
+                  type: string
+                email:
+                  type: string
+                  nullable: true
+
+    RestaurantUpdate:
+      type: object
+      properties:
+        name:
+          type: string
+          maxLength: 180
+        description:
+          type: string
+          maxLength: 2000
+        phone:
+          type: string
+        email:
+          type: string
+          format: email
+        currency:
+          type: string
+          enum: [USD, CDF]
+        minimum_order_amount:
+          type: string
+          pattern: '^\d{1,10}(\.\d{1,2})?$'
+          example: '8.50'
+        average_preparation_minutes:
+          type: integer
+          minimum: 1
+          maximum: 600
+        accepts_delivery:
+          type: boolean
+        accepts_pickup:
+          type: boolean
+        delivery_fee:
+          type: string
+          pattern: '^\d{1,10}(\.\d{1,2})?$'
+          example: '8.50'
+        free_delivery_threshold:
+          type: string
+          nullable: true
+        timezone:
+          type: string
+          enum: [Africa/Kinshasa, Africa/Lubumbashi]
+
+    RestaurantCreate:
+      allOf:
+        - $ref: '#/components/schemas/RestaurantUpdate'
+        - type: object
+          required: [name, phone, address]
+          properties:
+            address:
+              $ref: '#/components/schemas/AddressInput'
+      example:
+        name: Chez Mama Fifi
+        phone: '0812000111'
+        currency: USD
+        minimum_order_amount: '5.00'
+        delivery_fee: '2.00'
+        free_delivery_threshold: '30.00'
+        address:
+          address_line: 12 avenue du Commerce
+          commune: Gombe
+          city: Kinshasa
+
+    AvailabilityRequest:
+      type: object
+      required: [is_paused]
+      properties:
+        is_paused:
+          type: boolean
+
+    Address:
+      type: object
+      properties:
+        id:
+          type: integer
+        label:
+          type: string
+          nullable: true
+        address_line:
+          type: string
+        commune:
+          type: string
+          nullable: true
+        city:
+          type: string
+        province:
+          type: string
+          nullable: true
+        country:
+          type: string
+        latitude:
+          type: string
+          nullable: true
+        longitude:
+          type: string
+          nullable: true
+        is_primary:
+          type: boolean
+
+    AddressInput:
+      type: object
+      required: [address_line]
+      properties:
+        label:
+          type: string
+          maxLength: 100
+        address_line:
+          type: string
+          maxLength: 255
+        commune:
+          type: string
+        city:
+          type: string
+          default: Kinshasa
+        province:
+          type: string
+        latitude:
+          type: number
+          minimum: -90
+          maximum: 90
+        longitude:
+          type: number
+          minimum: -180
+          maximum: 180
+        is_primary:
+          type: boolean
+
+    OpeningHour:
+      type: object
+      properties:
+        day_of_week:
+          type: integer
+          minimum: 1
+          maximum: 7
+          description: 1 = lundi … 7 = dimanche
+        is_closed:
+          type: boolean
+        opens_at:
+          type: string
+          nullable: true
+          example: '09:00'
+        closes_at:
+          type: string
+          nullable: true
+          example: '22:00'
+
+    OpeningHoursRequest:
+      type: object
+      required: [days]
+      properties:
+        days:
+          type: array
+          maxItems: 7
+          items:
+            type: object
+            required: [day_of_week]
+            properties:
+              day_of_week:
+                type: integer
+                minimum: 1
+                maximum: 7
+              is_closed:
+                type: boolean
+              opens_at:
+                type: string
+                pattern: '^([01]\d|2[0-3]):[0-5]\d$'
+              closes_at:
+                type: string
+                pattern: '^([01]\d|2[0-3]):[0-5]\d$'
+      example:
+        days:
+          - day_of_week: 1
+            opens_at: '09:00'
+            closes_at: '22:00'
+          - day_of_week: 5
+            opens_at: '18:00'
+            closes_at: '02:00'
+          - day_of_week: 7
+            is_closed: true
+
+    StaffMember:
+      type: object
+      properties:
+        id:
+          type: integer
+          description: Identifiant de l'affectation (à utiliser dans /restaurant/staff/{memberId})
+        user:
+          type: object
+          properties:
+            id:
+              type: integer
+            first_name:
+              type: string
+            last_name:
+              type: string
+              nullable: true
+            phone:
+              type: string
+        role:
+          type: string
+          enum: [owner, manager, staff, cashier]
+        status:
+          type: string
+          enum: [active, invited, disabled]
+        created_at:
+          type: string
+          format: date-time
+
+    StaffCreate:
+      type: object
+      required: [phone, role]
+      properties:
+        phone:
+          type: string
+        role:
+          type: string
+          enum: [manager, staff, cashier]
+
+    StaffUpdate:
+      type: object
+      properties:
+        role:
+          type: string
+          enum: [manager, staff, cashier]
+        status:
+          type: string
+          enum: [active, disabled]
+
+    Category:
+      type: object
+      properties:
+        id:
+          type: integer
+        name:
+          type: string
+        description:
+          type: string
+          nullable: true
+        image_url:
+          type: string
+          nullable: true
+        sort_order:
+          type: integer
+        product_count:
+          type: integer
+        is_active:
+          type: boolean
+          description: Vue de gestion uniquement
+
+    CategoryInput:
+      type: object
+      properties:
+        name:
+          type: string
+          maxLength: 120
+        description:
+          type: string
+          maxLength: 500
+        is_active:
+          type: boolean
+
+    ReorderRequest:
+      type: object
+      required: [category_ids]
+      properties:
+        category_ids:
+          type: array
+          items:
+            type: integer
+
+    Variant:
+      type: object
+      properties:
+        id:
+          type: integer
+        name:
+          type: string
+        price_delta:
+          $ref: '#/components/schemas/Money'
+
+    OptionGroup:
+      type: object
+      properties:
+        id:
+          type: integer
+        name:
+          type: string
+        selection_type:
+          type: string
+          enum: [single, multiple]
+        is_required:
+          type: boolean
+        min_selections:
+          type: integer
+        max_selections:
+          type: integer
+        options:
+          type: array
+          items:
+            type: object
+            properties:
+              id:
+                type: integer
+              name:
+                type: string
+              price_delta:
+                $ref: '#/components/schemas/Money'
+
+    Product:
+      type: object
+      properties:
+        id:
+          type: integer
+        category:
+          type: object
+          nullable: true
+          properties:
+            id:
+              type: integer
+            name:
+              type: string
+        name:
+          type: string
+        slug:
+          type: string
+        description:
+          type: string
+          nullable: true
+        base_price:
+          $ref: '#/components/schemas/Money'
+        currency:
+          type: string
+          enum: [USD, CDF]
+        image_url:
+          type: string
+          nullable: true
+        images:
+          type: array
+          items:
+            type: object
+            properties:
+              id:
+                type: integer
+              url:
+                type: string
+              alt_text:
+                type: string
+                nullable: true
+        preparation_minutes:
+          type: integer
+          nullable: true
+        is_available:
+          type: boolean
+        is_featured:
+          type: boolean
+        variants:
+          type: array
+          items:
+            $ref: '#/components/schemas/Variant'
+        option_groups:
+          type: array
+          items:
+            $ref: '#/components/schemas/OptionGroup'
+
+    ProductManagement:
+      allOf:
+        - $ref: '#/components/schemas/Product'
+        - type: object
+          properties:
+            sku:
+              type: string
+              nullable: true
+            sort_order:
+              type: integer
+            created_at:
+              type: string
+              format: date-time
+            updated_at:
+              type: string
+              format: date-time
+
+    ProductInput:
+      type: object
+      properties:
+        category_id:
+          type: integer
+          nullable: true
+        name:
+          type: string
+          maxLength: 180
+        description:
+          type: string
+          maxLength: 5000
+        sku:
+          type: string
+          maxLength: 80
+          pattern: '^[A-Za-z0-9._-]+$'
+        base_price:
+          type: string
+          pattern: '^\d{1,10}(\.\d{1,2})?$'
+          example: '8.50'
+        preparation_minutes:
+          type: integer
+          minimum: 1
+          maximum: 600
+        is_available:
+          type: boolean
+        is_featured:
+          type: boolean
+        sort_order:
+          type: integer
+          minimum: 0
+        variants:
+          type: array
+          maxItems: 30
+          items:
+            type: object
+            required: [name]
+            properties:
+              id:
+                type: integer
+              name:
+                type: string
+              price_delta:
+                type: string
+                description: Écart par rapport au prix de base (peut être négatif ; prix final ≥ 0)
+              is_active:
+                type: boolean
+        option_groups:
+          type: array
+          maxItems: 20
+          items:
+            type: object
+            required: [name, options]
+            properties:
+              id:
+                type: integer
+              name:
+                type: string
+              selection_type:
+                type: string
+                enum: [single, multiple]
+                default: single
+              is_required:
+                type: boolean
+              min_selections:
+                type: integer
+                minimum: 0
+              max_selections:
+                type: integer
+                minimum: 1
+              options:
+                type: array
+                minItems: 1
+                maxItems: 50
+                items:
+                  type: object
+                  required: [name]
+                  properties:
+                    id:
+                      type: integer
+                    name:
+                      type: string
+                    price_delta:
+                      type: string
+                      description: Supplément (≥ 0)
+                    is_active:
+                      type: boolean
+      example:
+        name: Burger maison
+        base_price: '8.50'
+        category_id: 3
+        variants:
+          - name: Simple
+            price_delta: '0'
+          - name: Double
+            price_delta: '3.00'
+        option_groups:
+          - name: Cuisson
+            selection_type: single
+            is_required: true
+            options:
+              - name: Saignant
+              - name: Bien cuit
+
+    ProductAvailabilityRequest:
+      type: object
+      required: [is_available]
+      properties:
+        is_available:
+          type: boolean
+
+    ReasonRequest:
+      type: object
+      required: [reason]
+      properties:
+        reason:
+          type: string
+          minLength: 5
+          maxLength: 500
+
+    CommissionRequest:
+      type: object
+      required: [commission_rate]
+      properties:
+        commission_rate:
+          type: string
+          example: '10.00'
+
+    ProfileUpdate:
+      type: object
+      properties:
+        first_name:
+          type: string
+          maxLength: 100
+        last_name:
+          type: string
+          maxLength: 100
+        email:
+          type: string
+          format: email
+          maxLength: 190
+
+    CustomerAddress:
+      type: object
+      properties:
+        id:
+          type: integer
+        label:
+          type: string
+          nullable: true
+          example: Maison
+        recipient_name:
+          type: string
+          nullable: true
+        recipient_phone:
+          type: string
+          example: '+243812345678'
+        address_line:
+          type: string
+        commune:
+          type: string
+          nullable: true
+        neighborhood:
+          type: string
+          nullable: true
+        landmark:
+          type: string
+          nullable: true
+          description: Point de repère (très utilisé à Kinshasa)
+        city:
+          type: string
+        country:
+          type: string
+        latitude:
+          type: string
+          nullable: true
+        longitude:
+          type: string
+          nullable: true
+        delivery_instructions:
+          type: string
+          nullable: true
+        is_default:
+          type: boolean
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+          nullable: true
+
+    CustomerAddressInput:
+      type: object
+      required: [address_line]
+      description: À la modification, tous les champs sont facultatifs ; l'adresse, la ville et le pays ne peuvent pas être vidés.
+      properties:
+        label:
+          type: string
+          maxLength: 80
+        recipient_name:
+          type: string
+          maxLength: 150
+        recipient_phone:
+          type: string
+          description: Format RDC ou international ; normalisé en E.164
+        address_line:
+          type: string
+          minLength: 3
+          maxLength: 255
+        commune:
+          type: string
+          maxLength: 100
+        neighborhood:
+          type: string
+          maxLength: 120
+        landmark:
+          type: string
+          maxLength: 255
+        city:
+          type: string
+          maxLength: 100
+          default: Kinshasa
+        country:
+          type: string
+          maxLength: 100
+          default: RDC
+        latitude:
+          type: string
+        longitude:
+          type: string
+        delivery_instructions:
+          type: string
+          maxLength: 1000
+        is_default:
+          type: boolean
+
+    OrderItemInput:
+      type: object
+      required: [product_id, quantity]
+      properties:
+        product_id:
+          type: integer
+        quantity:
+          type: integer
+          minimum: 1
+          maximum: 99
+        variant_id:
+          type: integer
+          description: Obligatoire si le produit a des variantes actives
+        option_ids:
+          type: array
+          maxItems: 50
+          items:
+            type: integer
+        note:
+          type: string
+          maxLength: 500
+
+    OrderRequest:
+      type: object
+      required: [restaurant_id, order_type, items]
+      properties:
+        restaurant_id:
+          type: integer
+        order_type:
+          type: string
+          enum: [delivery, pickup]
+        delivery_address_id:
+          type: integer
+          description: Obligatoire en livraison ; adresse du client connecté
+        delivery_instructions:
+          type: string
+          maxLength: 1000
+          description: Par défaut, celles de l'adresse
+        customer_note:
+          type: string
+          maxLength: 1000
+        payment_method:
+          type: string
+          enum: [cash, mpesa, airtel_money, orange_money]
+          default: cash
+          description: Seul `cash` est activé pour le moment
+        requested_for:
+          type: string
+          format: date-time
+          description: Commande programmée (ISO 8601 avec fuseau), au moins le temps de préparation moyen et au plus 7 jours à l'avance
+          example: '2026-12-01T12:30:00+01:00'
+        expected_total:
+          $ref: '#/components/schemas/Money'
+        promo_code:
+          type: string
+          maxLength: 30
+          description: |
+            Code promo (insensible à la casse), remise calculée sur le sous-total hors livraison. Refus en 422 avec `errors.promo_code` :
+            `PROMO_CODE_INVALID`, `PROMO_CODE_INACTIVE`, `PROMO_CODE_NOT_STARTED`, `PROMO_CODE_EXPIRED`, `PROMO_CODE_CURRENCY_MISMATCH`,
+            `PROMO_MINIMUM_NOT_REACHED`, `PROMO_CODE_EXHAUSTED`, `PROMO_CODE_ALREADY_USED`. Revérifié sous verrou à la création :
+            si la remise a changé entre le devis et la commande, `409 PRICE_CHANGED`.
+        items:
+          type: array
+          minItems: 1
+          maxItems: 50
+          items:
+            $ref: '#/components/schemas/OrderItemInput'
+
+    OrderLine:
+      type: object
+      properties:
+        product_id:
+          type: integer
+          nullable: true
+        product_name:
+          type: string
+        variant_name:
+          type: string
+          nullable: true
+        quantity:
+          type: integer
+        unit_price:
+          $ref: '#/components/schemas/Money'
+        options:
+          type: array
+          items:
+            type: object
+            properties:
+              group:
+                type: string
+              name:
+                type: string
+              price_delta:
+                $ref: '#/components/schemas/Money'
+        line_total:
+          $ref: '#/components/schemas/Money'
+        note:
+          type: string
+          nullable: true
+
+    OrderQuote:
+      type: object
+      properties:
+        restaurant_id:
+          type: integer
+        order_type:
+          type: string
+          enum: [delivery, pickup]
+        payment_method:
+          type: string
+        requested_for:
+          type: string
+          format: date-time
+          nullable: true
+        currency:
+          type: string
+          enum: [USD, CDF]
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/OrderLine'
+        subtotal:
+          $ref: '#/components/schemas/Money'
+        discount_amount:
+          $ref: '#/components/schemas/Money'
+        delivery_fee:
+          $ref: '#/components/schemas/Money'
+        tax_amount:
+          $ref: '#/components/schemas/Money'
+        total_amount:
+          $ref: '#/components/schemas/Money'
+        promotion:
+          $ref: '#/components/schemas/OrderPromotion'
+
+    OrderSummary:
+      type: object
+      description: "`restaurant` est fourni au client, `customer` au restaurant."
+      properties:
+        id:
+          type: integer
+        order_number:
+          type: string
+          example: WF261125-K7Q2MX
+        status:
+          type: string
+          enum: [pending, accepted, preparing, ready, out_for_delivery, completed, cancelled, rejected]
+        payment_status:
+          type: string
+          enum: [unpaid, pending, paid, failed, refunded, partially_refunded]
+        order_type:
+          type: string
+          enum: [delivery, pickup]
+        currency:
+          type: string
+          enum: [USD, CDF]
+        subtotal:
+          $ref: '#/components/schemas/Money'
+        discount_amount:
+          $ref: '#/components/schemas/Money'
+        delivery_fee:
+          $ref: '#/components/schemas/Money'
+        tax_amount:
+          $ref: '#/components/schemas/Money'
+        total_amount:
+          $ref: '#/components/schemas/Money'
+        item_count:
+          type: integer
+        requested_for:
+          type: string
+          format: date-time
+          nullable: true
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+        restaurant:
+          type: object
+          properties:
+            id:
+              type: integer
+            name:
+              type: string
+            slug:
+              type: string
+            logo_url:
+              type: string
+              nullable: true
+            phone:
+              type: string
+              description: Détail uniquement
+        customer:
+          type: object
+          properties:
+            name:
+              type: string
+            phone:
+              type: string
+
+    Order:
+      allOf:
+        - $ref: '#/components/schemas/OrderSummary'
+        - type: object
+          properties:
+            delivery_address:
+              type: object
+              nullable: true
+              description: Copie de l'adresse au moment de la commande
+            delivery_instructions:
+              type: string
+              nullable: true
+            customer_note:
+              type: string
+              nullable: true
+            cancellation_reason:
+              type: string
+              nullable: true
+            accepted_at:
+              type: string
+              format: date-time
+              nullable: true
+            completed_at:
+              type: string
+              format: date-time
+              nullable: true
+            cancelled_at:
+              type: string
+              format: date-time
+              nullable: true
+            items:
+              type: array
+              items:
+                $ref: '#/components/schemas/OrderLine'
+            payment:
+              type: object
+              nullable: true
+              properties:
+                method:
+                  type: string
+                  example: cash
+                status:
+                  type: string
+                  enum: [initiated, pending, successful, failed, cancelled, refunded]
+                amount:
+                  $ref: '#/components/schemas/Money'
+                currency:
+                  type: string
+                reference:
+                  type: string
+                paid_at:
+                  type: string
+                  format: date-time
+                  nullable: true
+            status_history:
+              type: array
+              items:
+                type: object
+                properties:
+                  from:
+                    type: string
+                    nullable: true
+                  to:
+                    type: string
+                  comment:
+                    type: string
+                    nullable: true
+                  created_at:
+                    type: string
+                    format: date-time
+            next_statuses:
+              type: array
+              description: Statuts que l'utilisateur courant (client ou restaurant) peut appliquer
+              items:
+                type: string
+            promotion:
+              $ref: '#/components/schemas/OrderPromotion'
+            delivery:
+              $ref: '#/components/schemas/Delivery'
+            review:
+              allOf:
+                - $ref: '#/components/schemas/Review'
+              nullable: true
+              description: Client uniquement
+            can_review:
+              type: boolean
+              description: Client uniquement — la commande peut encore recevoir un avis
+
+    OrderStatusChange:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+          enum: [accepted, rejected, preparing, ready, out_for_delivery, completed, cancelled]
+        reason:
+          type: string
+          maxLength: 500
+          description: Obligatoire pour rejected et cancelled
+        courier_name:
+          type: string
+          maxLength: 150
+          description: Facultatif, pris en compte avec out_for_delivery (livreur du restaurant)
+        courier_phone:
+          type: string
+          description: Facultatif, avec courier_name
+
+    CancelRequest:
+      type: object
+      properties:
+        reason:
+          type: string
+          maxLength: 500
+
+    FinanceBalance:
+      type: object
+      properties:
+        currency:
+          type: string
+          enum: [USD, CDF]
+        commission_due:
+          $ref: '#/components/schemas/Money'
+        commission_pending:
+          $ref: '#/components/schemas/Money'
+
+    LedgerEntry:
+      type: object
+      properties:
+        id:
+          type: integer
+        type:
+          type: string
+          enum: [commission_accrued, commission_reversed, commission_settlement, payout, adjustment, platform_discount, platform_discount_reversed]
+          description: |
+            platform_discount (−) : remise d'un code promo WapiFood créditée au restaurant ; platform_discount_reversed (+) : son annulation (remboursement total)
+        currency:
+          type: string
+          enum: [USD, CDF]
+        amount:
+          $ref: '#/components/schemas/Money'
+        balance_after:
+          $ref: '#/components/schemas/Money'
+        order_id:
+          type: integer
+          nullable: true
+        order_number:
+          type: string
+          nullable: true
+        reference:
+          type: string
+          nullable: true
+        note:
+          type: string
+          nullable: true
+        created_at:
+          type: string
+          format: date-time
+
+    AdminBalance:
+      type: object
+      properties:
+        restaurant:
+          type: object
+          properties:
+            id:
+              type: integer
+            name:
+              type: string
+            status:
+              type: string
+        currency:
+          type: string
+        commission_due:
+          $ref: '#/components/schemas/Money'
+        updated_at:
+          type: string
+          format: date-time
+
+    SettlementRequest:
+      type: object
+      required: [amount, currency]
+      properties:
+        amount:
+          $ref: '#/components/schemas/Money'
+        currency:
+          type: string
+          enum: [USD, CDF]
+        reference:
+          type: string
+          maxLength: 120
+          description: Référence du reçu ou du virement
+        note:
+          type: string
+          maxLength: 500
+
+    AdjustmentRequest:
+      type: object
+      required: [amount, currency, note]
+      properties:
+        amount:
+          type: string
+          description: Montant signé (« -2.50 »)
+          example: '-2.50'
+        currency:
+          type: string
+          enum: [USD, CDF]
+        note:
+          type: string
+          minLength: 3
+          maxLength: 500
+
+    RefundRequest:
+      type: object
+      required: [amount, reason]
+      properties:
+        amount:
+          $ref: '#/components/schemas/Money'
+        reason:
+          type: string
+          minLength: 3
+          maxLength: 500
+
+    RefundResult:
+      type: object
+      properties:
+        refund_id:
+          type: integer
+        amount:
+          $ref: '#/components/schemas/Money'
+        currency:
+          type: string
+        total_refunded:
+          $ref: '#/components/schemas/Money'
+        payment_status:
+          type: string
+          enum: [partially_refunded, refunded]
+
+    AdminOrder:
+      allOf:
+        - $ref: '#/components/schemas/Order'
+        - type: object
+          properties:
+            refunds:
+              type: array
+              items:
+                type: object
+                properties:
+                  id:
+                    type: integer
+                  amount:
+                    $ref: '#/components/schemas/Money'
+                  currency:
+                    type: string
+                  status:
+                    type: string
+                    enum: [pending, completed, failed]
+                  reason:
+                    type: string
+                  created_at:
+                    type: string
+                    format: date-time
+
+    RatingSummary:
+      type: object
+      properties:
+        average:
+          type: string
+          nullable: true
+          example: '4.5'
+          description: Moyenne des avis publiés, au dixième (null sans avis)
+        count:
+          type: integer
+
+    Promotion:
+      type: object
+      properties:
+        id:
+          type: integer
+        code:
+          type: string
+          example: BIENVENUE10
+        title:
+          type: string
+        scope:
+          type: string
+          enum: [restaurant, platform]
+          description: restaurant = remise à la charge du restaurant ; platform = à la charge de WapiFood
+        restaurant_id:
+          type: integer
+          nullable: true
+        discount_type:
+          type: string
+          enum: [percentage, fixed]
+        discount_value:
+          $ref: '#/components/schemas/Money'
+        minimum_order_amount:
+          $ref: '#/components/schemas/Money'
+        maximum_discount_amount:
+          allOf:
+            - $ref: '#/components/schemas/Money'
+          nullable: true
+        currency:
+          type: string
+          enum: [USD, CDF]
+          nullable: true
+        usage_limit:
+          type: integer
+          nullable: true
+        usage_per_customer:
+          type: integer
+          nullable: true
+        usage_count:
+          type: integer
+          description: Utilisations comptées dans les limites (commandes ni refusées ni annulées)
+        starts_at:
+          type: string
+          format: date-time
+          nullable: true
+        ends_at:
+          type: string
+          format: date-time
+          nullable: true
+        is_active:
+          type: boolean
+        created_at:
+          type: string
+          format: date-time
+
+    PromotionInput:
+      type: object
+      required: [code, title, discount_type, discount_value]
+      properties:
+        code:
+          type: string
+          pattern: '^[A-Za-z0-9_-]{3,30}$'
+          description: Enregistré en majuscules, unique sur la plateforme
+        title:
+          type: string
+          maxLength: 150
+        discount_type:
+          type: string
+          enum: [percentage, fixed]
+        discount_value:
+          allOf:
+            - $ref: '#/components/schemas/Money'
+          description: Pourcentage (0 < x ≤ 100) ou montant fixe
+        minimum_order_amount:
+          allOf:
+            - $ref: '#/components/schemas/Money'
+          description: Sous-total minimum (hors livraison), 0 par défaut
+        maximum_discount_amount:
+          allOf:
+            - $ref: '#/components/schemas/Money'
+          description: Plafond d'une remise en pourcentage
+        currency:
+          type: string
+          enum: [USD, CDF]
+          description: Code restaurant = devise du restaurant. Code plateforme = obligatoire si le code contient un montant
+        usage_limit:
+          type: integer
+          minimum: 1
+        usage_per_customer:
+          type: integer
+          minimum: 1
+        starts_at:
+          type: string
+          format: date-time
+          example: '2026-12-01T00:00:00+01:00'
+        ends_at:
+          type: string
+          format: date-time
+        is_active:
+          type: boolean
+          default: true
+
+    PromotionStatusRequest:
+      type: object
+      required: [is_active]
+      properties:
+        is_active:
+          type: boolean
+
+    OrderPromotion:
+      type: object
+      nullable: true
+      properties:
+        code:
+          type: string
+        title:
+          type: string
+        funded_by:
+          type: string
+          enum: [restaurant, platform]
+        discount_amount:
+          $ref: '#/components/schemas/Money'
+
+    Delivery:
+      type: object
+      nullable: true
+      description: Livraison par le restaurant (null pour un retrait sur place)
+      properties:
+        status:
+          type: string
+          enum: [pending, assigned, picked_up, in_transit, delivered, failed, cancelled]
+        managed_by:
+          type: string
+          enum: [restaurant, wapifood]
+        courier_name:
+          type: string
+          nullable: true
+        courier_phone:
+          type: string
+          nullable: true
+        picked_up_at:
+          type: string
+          format: date-time
+          nullable: true
+        delivered_at:
+          type: string
+          format: date-time
+          nullable: true
+        notes:
+          type: string
+          nullable: true
+          description: Restaurant uniquement
+        has_proof:
+          type: boolean
+          description: Restaurant uniquement
+
+    CourierAssignment:
+      type: object
+      required: [courier_name]
+      properties:
+        courier_name:
+          type: string
+          minLength: 2
+          maxLength: 150
+        courier_phone:
+          type: string
+          example: '0991234567'
+        notes:
+          type: string
+          maxLength: 1000
+
+    DeliveryFailureRequest:
+      type: object
+      required: [reason]
+      properties:
+        reason:
+          type: string
+          minLength: 3
+          maxLength: 500
+          example: Client injoignable à l'adresse indiquée
+
+    ReviewRequest:
+      type: object
+      required: [rating]
+      properties:
+        rating:
+          type: integer
+          minimum: 1
+          maximum: 5
+        comment:
+          type: string
+          maxLength: 1000
+
+    PublicReview:
+      type: object
+      properties:
+        id:
+          type: integer
+        rating:
+          type: integer
+        comment:
+          type: string
+          nullable: true
+        author:
+          type: string
+          example: Grâce M.
+        created_at:
+          type: string
+          format: date-time
+
+    Review:
+      allOf:
+        - $ref: '#/components/schemas/PublicReview'
+        - type: object
+          properties:
+            status:
+              type: string
+              enum: [published, hidden, pending]
+            order_id:
+              type: integer
+            order_number:
+              type: string
+            restaurant:
+              type: object
+              description: Client uniquement
+              properties:
+                id:
+                  type: integer
+                name:
+                  type: string
+
+    AdminReview:
+      allOf:
+        - $ref: '#/components/schemas/Review'
+        - type: object
+          properties:
+            customer_id:
+              type: integer
+            moderated_at:
+              type: string
+              format: date-time
+              nullable: true
+            moderation_reason:
+              type: string
+              nullable: true
+
+    ModerationRequest:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+          enum: [hidden, published]
+        reason:
+          type: string
+          maxLength: 500
+          description: Obligatoire pour masquer
+
+    Notification:
+      type: object
+      properties:
+        id:
+          type: integer
+        type:
+          type: string
+          example: order.accepted
+          description: |
+            order.placed, order.cancelled_by_customer, order.accepted, order.rejected, order.preparing, order.ready,
+            order.out_for_delivery, order.completed, order.cancelled, order.delivery_failed, payment.refunded,
+            review.created, restaurant.approved, restaurant.rejected, restaurant.suspended, restaurant.reactivated
+        title:
+          type: string
+        message:
+          type: string
+        data:
+          type: object
+          nullable: true
+          description: Liens profonds (order_id, order_number, restaurant_id)
+        is_read:
+          type: boolean
+        read_at:
+          type: string
+          format: date-time
+          nullable: true
+        created_at:
+          type: string
+          format: date-time
+
+    ReadAllResult:
+      type: object
+      properties:
+        updated:
+          type: integer
+
+    AdminNotification:
+      allOf:
+        - $ref: '#/components/schemas/Notification'
+        - type: object
+          properties:
+            channel:
+              type: string
+              enum: [in_app, email, sms, whatsapp, push]
+            recipient:
+              type: string
+              nullable: true
+            status:
+              type: string
+              enum: [queued, sent, failed, read]
+            user_id:
+              type: integer
+              nullable: true
+            restaurant_id:
+              type: integer
+              nullable: true
+            attempts:
+              type: integer
+            max_attempts:
+              type: integer
+            next_attempt_at:
+              type: string
+              format: date-time
+              nullable: true
+            last_error:
+              type: string
+              nullable: true
+            sent_at:
+              type: string
+              format: date-time
+              nullable: true
+
+    AdminNotificationDetail:
+      allOf:
+        - $ref: '#/components/schemas/AdminNotification'
+        - type: object
+          properties:
+            attempt_history:
+              type: array
+              items:
+                type: object
+                properties:
+                  attempt:
+                    type: integer
+                  provider:
+                    type: string
+                  status:
+                    type: string
+                    enum: [sent, failed]
+                  provider_message_id:
+                    type: string
+                    nullable: true
+                  error:
+                    type: string
+                    nullable: true
+                  created_at:
+                    type: string
+                    format: date-time
+
+    WebhookResult:
+      type: object
+      properties:
+        status:
+          type: string
+          enum: [processed, duplicate, ignored]
+
+  responses:
+    Unauthorized:
+      description: Non authentifié ou session invalide
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+          example:
+            success: false
+            message: Session expirée. Renouvelez votre jeton.
+            errors: {}
+            meta:
+              code: TOKEN_EXPIRED
+    Forbidden:
+      description: Accès refusé (compte suspendu, non vérifié, rôle ou permission insuffisants)
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+          example:
+            success: false
+            message: Ce compte est suspendu. Contactez le support WapiFood.
+            errors: {}
+            meta:
+              code: ACCOUNT_SUSPENDED
+    Conflict:
+      description: Conflit métier
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+          example:
+            success: false
+            message: Ce numéro de téléphone est déjà associé à un compte.
+            errors:
+              phone: Déjà utilisé.
+            meta:
+              code: PHONE_TAKEN
+    ValidationError:
+      description: Données invalides
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+          example:
+            success: false
+            message: Les données envoyées sont invalides.
+            errors:
+              phone: Le champ téléphone est obligatoire.
+            meta:
+              code: VALIDATION_FAILED
+    InvalidJson:
+      description: Corps de requête JSON invalide
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+          example:
+            success: false
+            message: Le corps de la requête n'est pas un JSON valide.
+            errors: {}
+            meta:
+              code: INVALID_JSON
+    OtpUnavailable:
+      description: Aucun fournisseur d'envoi de codes n'est configuré
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+          example:
+            success: false
+            message: L'envoi de codes de vérification est momentanément indisponible.
+            errors: {}
+            meta:
+              code: OTP_DELIVERY_UNAVAILABLE
+    EmptySuccess:
+      description: Opération effectuée
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/SuccessEnvelope'
+          example:
+            success: true
+            message: Opération effectuée avec succès.
+            data: {}
+            meta: null
+    TokensResponse:
+      description: Nouvelle paire de jetons
+      content:
+        application/json:
+          schema:
+            allOf:
+              - $ref: '#/components/schemas/SuccessEnvelope'
+              - type: object
+                properties:
+                  data:
+                    type: object
+                    properties:
+                      tokens:
+                        $ref: '#/components/schemas/Tokens'
+    NotFound:
+      description: Ressource ou route introuvable
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+          example:
+            success: false
+            message: Ressource introuvable.
+            errors: {}
+            meta: null
+    TooManyRequests:
+      description: Limite de requêtes atteinte
+      headers:
+        Retry-After:
+          description: Délai en secondes avant de réessayer
+          schema:
+            type: integer
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+          example:
+            success: false
+            message: Trop de requêtes. Réessayez plus tard.
+            errors: {}
+            meta:
+              code: RATE_LIMITED
